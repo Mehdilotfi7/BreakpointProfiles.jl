@@ -4,7 +4,14 @@ Profile-likelihood-based uncertainty quantification for ordinary differential eq
 
 ## Installation
 
-The package is not yet registered. Install it from the local repository by developing it:
+The package is not yet registered in the Julia General registry. Install it directly from GitHub:
+
+```julia
+using Pkg
+Pkg.add(url="https://github.com/Mehdilotfi7/BreakpointProfiles.jl")
+```
+
+Or clone the repository and develop it locally:
 
 ```julia
 using Pkg
