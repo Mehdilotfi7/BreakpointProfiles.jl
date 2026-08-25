@@ -55,9 +55,21 @@ visualised with `plot_profiles`:
 
 ```julia
 using BreakpointProfiles, Plots
+
+# Conditional parameter profiles (changepoints fixed)
 profiles = [profile_parameter(prob, i) for i in 1:length(prob)]
 plot_profiles(profiles; filename="profiles.png")
+
+# Joint parameter profiles (changepoints re-optimised)
+joint_profiles = [profile_parameter_joint(prob, i) for i in 1:length(prob)]
+plot_profiles(joint_profiles; filename="joint_profiles.png",
+              title="Joint profile-likelihood curves")
+
+# Changepoint-location profiles
+threshold = prob.best_loss + chi2_threshold(1, 0.95)
+cp_profiles = profile_all_changepoints(prob; window=7)
+plot_cp_profiles(cp_profiles, threshold; filename="cp_profiles.png")
 ```
 
-If `Plots` is not loaded, `plot_profiles` raises an error prompting the user to
-load it first.
+If `Plots` is not loaded, the plotting functions raise an error prompting the
+user to load it first.

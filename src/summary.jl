@@ -76,13 +76,21 @@ function to_profile_dataframe(profiles::Vector{ProfileResult})
 end
 
 """
-    plot_profiles(profiles::Vector{ProfileResult}; filename=nothing)
+    plot_profiles(profiles::Vector{ProfileResult}; filename=nothing,
+                  title="Profile-likelihood curves", kwargs...)
 
-Create a multi-panel figure of profile-likelihood curves.
+Create a multi-panel figure of profile-likelihood curves in the style used for
+MICA PLE figures.
 
-Requires `Plots.jl` to be loaded in the calling environment.  If `Plots` is not
-available, the function raises an error."""
-function plot_profiles(profiles::Vector{ProfileResult}; filename=nothing)
+Each subplot shows the profile curve (steel-blue line with markers), the
+reference loss threshold (crimson dashed horizontal line), the best-fit value
+(dark-green dashed vertical line), and the approximate confidence interval
+(gold shaded region).  The x-axis is switched to log scale automatically when
+all profile values are positive and span more than one order of magnitude.
+
+Requires `Plots.jl` to be loaded in the calling environment."""
+function plot_profiles(profiles::Vector{ProfileResult}; filename=nothing,
+                       title::String="Profile-likelihood curves")
     if !isdefined(Main, :Plots)
         error("plot_profiles requires Plots.jl to be loaded in the calling environment")
     end
@@ -90,18 +98,116 @@ function plot_profiles(profiles::Vector{ProfileResult}; filename=nothing)
     n = length(profiles)
     ncols = min(4, n)
     nrows = ceil(Int, n / ncols)
-    fig = Plots.plot(layout=(nrows, ncols), size=(4 * 300, nrows * 250))
+    fig = Plots.plot(layout=(nrows, ncols), size=(300 * ncols, 250 * nrows),
+                     framestyle=:box, grid=true, gridalpha=0.3)
+
+    n_ident = 0
     for (i, p) in enumerate(profiles)
+        p.identifiable && (n_ident += 1)
         perm = sortperm(p.values)
         vals = p.values[perm]
         los = p.losses[perm]
-        Plots.plot!(fig[i], vals, los, label="", xlabel=p.parameter, ylabel="loss")
-        Plots.hline!(fig[i], [p.threshold], label="95% threshold", ls=:dash)
-        Plots.vline!(fig[i], [p.best_value], label="best", ls=:dot)
+
+        # Automatic log scale when values are positive and span >10x
+        use_log = all(vals .> 0) && (maximum(vals) / minimum(vals)) > 10.0
+
+        Plots.plot!(fig[i], vals, los, seriestype=:path,
+                    color=:steelblue, lw=1.0, label="")
+        Plots.scatter!(fig[i], vals, los, markersize=3, color=:steelblue,
+                       label="")
+        Plots.hline!(fig[i], [p.threshold], color=:crimson, ls=:dash, lw=0.8,
+                     label="")
+        Plots.vline!(fig[i], [p.best_value], color=:darkgreen, ls=:dash, lw=1.0,
+                     label="")
         if p.ci_lower < p.ci_upper
-            Plots.vspan!(fig[i], [p.ci_lower, p.ci_upper], label="CI", alpha=0.2)
+            lo, hi = minmax(p.ci_lower, p.ci_upper)
+            Plots.vspan!(fig[i], [lo, hi], color=:gold, alpha=0.25, label="")
         end
+
+        Plots.plot!(fig[i], xlabel="parameter value", ylabel="loss",
+                    title=p.parameter, titlefontsize=9,
+                    xscale=use_log ? :log10 : :identity,
+                    tickfontsize=6, labelfontsize=7)
     end
+
+    for j in (n + 1):(nrows * ncols)
+        Plots.plot!(fig[j], axis=([], false), grid=false)
+    end
+
+    ref_loss = profiles[1].best_loss
+    threshold = profiles[1].threshold
+    Plots.plot!(fig, plot_title="$title | ref loss=$(round(ref_loss, digits=2)) | " *
+                                "threshold=$(round(threshold, digits=2)) | " *
+                                "identifiable=$n_ident/$n",
+                plot_titlefontsize=11)
+
+    if filename !== nothing
+        Plots.savefig(fig, filename)
+    end
+    return fig
+end
+
+"""
+    plot_cp_profiles(cp_profiles::Vector{CPProfileResult}, threshold::Real;
+                     filename=nothing, title="Changepoint profile curves")
+
+Create a multi-panel figure of changepoint-location profile curves.
+
+Each subplot shows the discrete loss profile (steel-blue line with markers), the
+reference loss threshold (crimson dashed horizontal line), the detected
+changepoint (dark-green dashed vertical line), and the confidence-set bounds
+(gold dashed vertical lines)."""
+function plot_cp_profiles(cp_profiles::Vector{CPProfileResult}, threshold::Real;
+                          filename=nothing,
+                          title::String="Changepoint profile curves")
+    if !isdefined(Main, :Plots)
+        error("plot_cp_profiles requires Plots.jl to be loaded in the calling environment")
+    end
+    Plots = Main.Plots
+    n = length(cp_profiles)
+    ncols = min(4, n)
+    nrows = ceil(Int, n / ncols)
+    fig = Plots.plot(layout=(nrows, ncols), size=(400 * ncols, 300 * nrows),
+                     framestyle=:box, grid=true, gridalpha=0.3)
+
+    n_ident = 0
+    for (i, cp) in enumerate(cp_profiles)
+        cands = cp.candidate_cps
+        los = cp.losses
+        lo, hi, id = cp_ci(cp, Float64(threshold))
+        id && (n_ident += 1)
+
+        perm = sortperm(cands)
+        cands = cands[perm]
+        los = los[perm]
+
+        Plots.plot!(fig[i], cands, los, seriestype=:path,
+                    color=:steelblue, lw=1.5, label="")
+        Plots.scatter!(fig[i], cands, los, markersize=3, color=:steelblue,
+                       label="")
+        Plots.hline!(fig[i], [threshold], color=:crimson, ls=:dash, lw=0.8,
+                     label="")
+        Plots.vline!(fig[i], [cp.original_cp], color=:darkgreen, ls=:dash, lw=1.0,
+                     label="")
+        if !ismissing(lo) && !ismissing(hi)
+            Plots.vline!(fig[i], [lo], color=:gold, ls=:dash, lw=1.5, label="")
+            Plots.vline!(fig[i], [hi], color=:gold, ls=:dash, lw=1.5, label="")
+        end
+
+        ci_text = ismissing(lo) ? "CI = [-, -]" : "CI = [$lo, $hi]"
+        Plots.plot!(fig[i], xlabel="candidate changepoint", ylabel="loss",
+                    title="CP $(cp.cp_index) (original=$(cp.original_cp))\n$ci_text, identifiable=$id",
+                    titlefontsize=9, tickfontsize=6, labelfontsize=7)
+    end
+
+    for j in (n + 1):(nrows * ncols)
+        Plots.plot!(fig[j], axis=([], false), grid=false)
+    end
+
+    Plots.plot!(fig, plot_title="$title | threshold=$(round(Float64(threshold), digits=2)) | " *
+                                "identifiable=$n_ident/$n",
+                plot_titlefontsize=11)
+
     if filename !== nothing
         Plots.savefig(fig, filename)
     end

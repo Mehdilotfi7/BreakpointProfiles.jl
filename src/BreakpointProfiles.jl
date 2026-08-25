@@ -57,8 +57,7 @@ export AbstractPLEProblem,
        to_profile_dataframe,
        print_summary_table,
        plot_profiles,
-       bootstrap_threshold,
-       bootstrap_thresholds
+       plot_cp_profiles
 
 include("types.jl")
 include("likelihoods.jl")
