@@ -41,8 +41,8 @@ Negative Laplace log-likelihood on log-transformed observations.
 This corresponds to an L1 loss on log-transformed data, similar to the MICA
 default. Because the Laplace likelihood is not Gaussian, Wilks' theorem does
 not apply and the standard χ² threshold of 3.84 is **not** rigorously valid
-for 95% confidence intervals. For L1 losses, use a bootstrap-derived threshold
-(see `bootstrap_threshold`) or a likelihood-appropriate criterion.
+for 95% confidence intervals. Users of L1 losses must supply a
+likelihood-appropriate threshold.
 """
 struct LaplaceLogLikelihood <: AbstractLikelihood
     sigma::Float64

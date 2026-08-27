@@ -45,8 +45,11 @@ prob = ODEChangepointPLEProblem(
     n_segment_specific = n_segment_specific
 )
 
-# Profile the first parameter
-prof = profile_parameter(prob, 1; n_points=20, method=:adaptive)
+# Conditional profile-likelihood for the first parameter
+prof = profile_parameter(prob, 1)
+
+# Joint profile-likelihood for the first parameter
+joint_prof = profile_parameter_joint(prob, 1)
 
 # Profile a changepoint location
 cp_prof = profile_changepoint(prob, 1; window=7)
@@ -58,12 +61,13 @@ write_profiles("ple_results.csv", [prof])
 
 ## Key features
 
+* Conditional and joint profile-likelihood for continuous parameters.
+* Changepoint-location profiling by re-optimisation of all other parameters.
 * Adaptive or fixed profile-likelihood grids with automatic bound handling.
-* Multiple optimiser backends: Evolutionary (GA), Optim (LBFGS), and NLopt.
+* Multiple optimiser backends: Evolutionary (GA), Metaheuristics (DE), Optim (LBFGS), NLopt (BOBYQA), and multi-start/hybrid pipelines.
 * Built-in Gaussian and Laplace negative log-likelihoods plus custom losses.
-* Changepoint location profiling by re-optimisation of all other parameters.
-* Confidence-interval extraction and structural/practical identifiability checks.
-* CSV/DataFrame export and optional plotting helpers.
+* Confidence-interval extraction and practical identifiability checks.
+* CSV/DataFrame export, Markdown reports, and optional plotting helpers.
 
 ## Next steps
 

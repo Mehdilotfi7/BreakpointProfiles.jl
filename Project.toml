@@ -1,7 +1,7 @@
 name = "BreakpointProfiles"
 uuid = "781e6dd1-d25d-4a40-935c-45726c4a1f7d"
 version = "0.1.0"
-authors = ["Mehdi Lotfi <mehdi.lotfi@uni-greifswald.de>"]
+authors = ["Mehdi Lotfi"]
 
 [deps]
 CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"

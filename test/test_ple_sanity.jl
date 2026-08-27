@@ -222,40 +222,7 @@ using Random
     end
 
     # =========================================================================
-    # Test 7: Per-parameter bootstrap thresholds
-    # =========================================================================
-    @testset "Per-parameter bootstrap thresholds" begin
-        # Linear regression: y = θ[1] * x + θ[2] + noise
-        Random.seed!(123)
-        x = collect(range(0, 1, length=50))
-        true_θ = [2.0, 1.0]
-        y = true_θ[1] .* x .+ true_θ[2] .+ 0.1 .* randn(50)
-
-        obj(θ, data) = sum((θ[1] .* data[1] .+ θ[2] .- data[2]).^2)
-        best_θ = [2.0, 1.0]
-        best_loss = obj(best_θ, (x, y))
-
-        function data_gen()
-            yb = best_θ[1] .* x .+ best_θ[2] .+ 0.1 .* randn(50)
-            return (x, yb)
-        end
-
-        opt = OptimPLEConfig(Fminbox(LBFGS()), Optim.Options(show_trace=false, iterations=100))
-        margins = bootstrap_thresholds(data_gen, obj, best_θ;
-                                     n_boot=30, alpha=0.95,
-                                     lb=[-10.0, -10.0], ub=[10.0, 10.0],
-                                     optimizer=opt)
-
-        @test length(margins) == 2
-        @test all(m -> m >= 0.0, margins)
-        @test all(m -> isfinite(m), margins)
-        # Both parameters should have positive margins in this well-identified model
-        @test margins[1] > 0.0
-        @test margins[2] > 0.0
-    end
-
-    # =========================================================================
-    # Test 8: ple_ci_interpolated accuracy
+    # Test 7: ple_ci_interpolated accuracy
     # =========================================================================
     @testset "Interpolated CI" begin
         # Parabolic profile: loss = (θ - 5)² with best_loss = 0
