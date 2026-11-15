@@ -7,7 +7,10 @@ using BreakpointProfiles
 
 makedocs(
     sitename = "BreakpointProfiles.jl",
-    format = Documenter.HTML(repolink = "https://github.com/Mehdilotfi7/BreakpointProfiles.jl"),
+    format = Documenter.HTML(
+        repolink = "https://github.com/Mehdilotfi7/BreakpointProfiles.jl",
+        sidebar_sitename = false
+    ),
     modules = [BreakpointProfiles],
     pages = [
         "Home" => "index.md",
