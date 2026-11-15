@@ -1,5 +1,9 @@
 # BreakpointProfiles.jl
 
+<p align="center">
+  <img src="docs/icons/breakpointprofile_icon.png" alt="BreakpointProfiles.jl logo" width="220">
+</p>
+
 Profile-likelihood-based uncertainty quantification for ordinary differential equation (ODE) models with fixed changepoints.
 
 This package is designed to be used **after** a changepoint-detection step (for example with [Mica.jl](https://github.com/Mehdilotfi7/Mica.jl)), once the number and locations of changepoints have been determined. `BreakpointProfiles.jl` then quantifies the uncertainty around the fitted parameters and the detected changepoint locations via profile-likelihood methods.
