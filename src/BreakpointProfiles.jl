@@ -14,6 +14,7 @@ using Statistics
 
 export AbstractPLEProblem,
        ODEChangepointPLEProblem,
+       BaselinePLEProblem,
        ProfileResult,
        CPProfileResult,
        ProfileOptions,
@@ -61,6 +62,7 @@ export AbstractPLEProblem,
        plot_cp_profiles
 
 include("types.jl")
+include("baseline.jl")
 include("likelihoods.jl")
 include("optimizers.jl")
 include("parameter_profile.jl")

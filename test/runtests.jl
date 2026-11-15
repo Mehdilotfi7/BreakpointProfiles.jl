@@ -3,6 +3,7 @@ using Test
 
 @testset "BreakpointProfiles.jl" begin
     include("test_types.jl")
+    include("test_baseline.jl")
     include("test_likelihoods.jl")
     include("test_parameter_profile.jl")
     include("test_changepoint_profile.jl")

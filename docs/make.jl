@@ -7,7 +7,7 @@ using BreakpointProfiles
 
 makedocs(
     sitename = "BreakpointProfiles.jl",
-    format = Documenter.HTML(),
+    format = Documenter.HTML(repolink = "https://github.com/Mehdilotfi7/BreakpointProfiles.jl"),
     modules = [BreakpointProfiles],
     pages = [
         "Home" => "index.md",
@@ -15,4 +15,10 @@ makedocs(
         "Examples" => "examples.md"
     ],
     remotes = nothing
+)
+
+deploydocs(
+    repo = "github.com/Mehdilotfi7/BreakpointProfiles.jl.git",
+    devbranch = "main",
+    push_preview = false
 )
