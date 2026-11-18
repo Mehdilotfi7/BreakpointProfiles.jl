@@ -59,7 +59,8 @@ export AbstractPLEProblem,
        to_profile_dataframe,
        print_summary_table,
        plot_profiles,
-       plot_cp_profiles
+       plot_cp_profiles,
+       plot_profile_panels
 
 include("types.jl")
 include("baseline.jl")

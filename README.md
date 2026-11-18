@@ -1,5 +1,9 @@
 # BreakpointProfiles.jl
 
+[![CI](https://github.com/Mehdilotfi7/BreakpointProfiles.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/Mehdilotfi7/BreakpointProfiles.jl/actions/workflows/CI.yml)
+[![Coverage](https://codecov.io/gh/Mehdilotfi7/BreakpointProfiles.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/Mehdilotfi7/BreakpointProfiles.jl)
+[![Documentation](https://img.shields.io/badge/docs-stable-blue.svg)](https://mehdilotfi7.github.io/BreakpointProfiles.jl/)
+
 <p align="center">
   <img src="docs/icons/breakpointprofile_icon.png" alt="BreakpointProfiles.jl logo" width="220">
 </p>
@@ -12,13 +16,15 @@ This package is designed to be used **after** a changepoint-detection step (for 
 
 The adaptive profile-likelihood engine and the confidence-interval extraction in this package were inspired by and validated against the Data2Dynamics (D2D) MATLAB profile-likelihood (Raue et al., *Bioinformatics* 2015; Raue et al., *PLOS ONE* 2013). Users familiar with D2D will recognise the D2D-style adaptive outward stepping, warm-start re-optimisation, and jump-smoothing strategy.
 
+[ProfileLikelihood.jl](https://github.com/DanielVandH/ProfileLikelihood.jl) provides general profile-likelihood analysis for model parameters. BreakpointProfiles.jl complements it with discrete changepoint-location profiles, joint profiling in which changepoints are re-optimized as nuisance parameters, and a common API for baseline, conditional, and changepoint-aware analyses.
+
 ## Installation
 
-Install the package directly from GitHub:
+Install the registered package with:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/Mehdilotfi7/BreakpointProfiles.jl")
+Pkg.add("BreakpointProfiles")
 ```
 
 Or clone the repository and develop it locally:
@@ -34,7 +40,7 @@ Pkg.develop(path="path/to/BreakpointProfiles.jl")
 using BreakpointProfiles
 
 # Build a problem from a previously fitted changepoint model
-# (e.g. obtained with Mica.jl; see examples/ for a full COVID-19 workflow)
+# (see examples/baseline_and_changepoint.jl for a complete workflow)
 prob = ODEChangepointPLEProblem(
     objective = (params, cps) -> my_loss(params, cps),
     data = my_data,
@@ -133,9 +139,6 @@ profiling method or confidence threshold.
   (`best_loss + 3.8415` for 1 df, 95%).
 - **Laplace (L1) losses:** Wilks' theorem does not apply. Pass a user-derived
   threshold to `profile_parameter(...; threshold=...)`.
-
-The COVID driver (`examples/covid_ple_example.jl`) supports both `L1` and `L2`
-modes via the `COVID_PLE_LOSS` environment variable.
 
 
 ## Citation

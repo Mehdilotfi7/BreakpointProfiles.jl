@@ -9,6 +9,10 @@ equation (ODE) models with fixed changepoints.
 profiling the likelihood of parameters and changepoint locations in ODE models
 whose changepoints are treated as known.  It was originally written to support
 the uncertainty analysis in the MICA project, but is designed to be generic.
+Compared with [ProfileLikelihood.jl](https://github.com/DanielVandH/ProfileLikelihood.jl),
+its distinguishing feature is changepoint-aware profiling, including discrete
+changepoint-location profiles and joint profiles that re-optimize changepoints
+as nuisance parameters.
 
 The package can work with any model that exposes one of the following:
 
@@ -18,12 +22,11 @@ The package can work with any model that exposes one of the following:
 
 ## Installation
 
-The package is not yet registered.  Install it from a local clone by developing
-it:
+Install the registered package with:
 
 ```julia
 using Pkg
-Pkg.develop(path="path/to/BreakpointProfiles.jl")
+Pkg.add("BreakpointProfiles")
 ```
 
 ## Quick start
@@ -61,6 +64,7 @@ write_profiles("ple_results.csv", [prof])
 
 ## Key features
 
+* Baseline profile-likelihood for models without changepoints.
 * Conditional and joint profile-likelihood for continuous parameters.
 * Changepoint-location profiling by re-optimisation of all other parameters.
 * Adaptive or fixed profile-likelihood grids with automatic bound handling.
@@ -72,7 +76,7 @@ write_profiles("ple_results.csv", [prof])
 ## Next steps
 
 * See the [API reference](api.md) for a complete list of types and functions.
-* See the [Examples](examples.md) page for a COVID-19 workflow.
+* See the [Examples](examples.md) page for a self-contained baseline and changepoint-aware workflow.
 
 ## License
 

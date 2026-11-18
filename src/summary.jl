@@ -75,144 +75,52 @@ function to_profile_dataframe(profiles::Vector{ProfileResult})
     return df
 end
 
-"""
-    plot_profiles(profiles::Vector{ProfileResult}; filename=nothing,
-                  title="Profile-likelihood curves", kwargs...)
+"""Plot profile-likelihood curves when Plots.jl is loaded."""
+function plot_profiles end
 
-Create a multi-panel figure of profile-likelihood curves in the style used for
-MICA PLE figures.
+"""Plot changepoint-location profile curves when Plots.jl is loaded."""
+function plot_cp_profiles end
 
-Each subplot shows the profile curve (steel-blue line with markers), the
-reference loss threshold (crimson dashed horizontal line), the best-fit value
-(dark-green dashed vertical line), and the approximate confidence interval
-(gold shaded region).  The x-axis is switched to log scale automatically when
-all profile values are positive and span more than one order of magnitude.
-
-Requires `Plots.jl` to be loaded in the calling environment."""
-function plot_profiles(profiles::Vector{ProfileResult}; filename=nothing,
-                       title::String="Profile-likelihood curves")
-    if !isdefined(Main, :Plots)
-        error("plot_profiles requires Plots.jl to be loaded in the calling environment")
+function _pchip_eval(x::Vector{Float64}, y::Vector{Float64}, xs::Vector{Float64})
+    n = length(x)
+    n == 1 && return fill(y[1], length(xs))
+    if n == 2
+        return [y[1] + (y[2] - y[1]) / (x[2] - x[1]) * (xi - x[1]) for xi in xs]
     end
-    Plots = Main.Plots
-    n = length(profiles)
-    ncols = min(4, n)
-    nrows = ceil(Int, n / ncols)
-    fig = Plots.plot(layout=(nrows, ncols), size=(300 * ncols, 250 * nrows),
-                     framestyle=:box, grid=true, gridalpha=0.3)
-
-    n_ident = 0
-    for (i, p) in enumerate(profiles)
-        p.identifiable && (n_ident += 1)
-        perm = sortperm(p.values)
-        vals = p.values[perm]
-        los = p.losses[perm]
-
-        # Automatic log scale when values are positive and span >10x
-        use_log = all(vals .> 0) && (maximum(vals) / minimum(vals)) > 10.0
-
-        Plots.plot!(fig[i], vals, los, seriestype=:path,
-                    color=:steelblue, lw=1.0, label="")
-        Plots.scatter!(fig[i], vals, los, markersize=3, color=:steelblue,
-                       label="")
-        Plots.hline!(fig[i], [p.threshold], color=:crimson, ls=:dash, lw=0.8,
-                     label="")
-        Plots.vline!(fig[i], [p.best_value], color=:darkgreen, ls=:dash, lw=1.0,
-                     label="")
-        if p.ci_lower < p.ci_upper
-            lo, hi = minmax(p.ci_lower, p.ci_upper)
-            Plots.vspan!(fig[i], [lo, hi], color=:gold, alpha=0.25, label="")
+    h = diff(x)
+    d = diff(y) ./ h
+    m = zeros(n)
+    m[1], m[n] = d[1], d[end]
+    for k in 2:(n - 1)
+        if d[k - 1] * d[k] <= 0
+            m[k] = 0.0
+        else
+            w1 = 2 * h[k] + h[k - 1]
+            w2 = h[k] + 2 * h[k - 1]
+            m[k] = (w1 + w2) / (w1 / d[k - 1] + w2 / d[k])
         end
-
-        Plots.plot!(fig[i], xlabel="parameter value", ylabel="loss",
-                    title=p.parameter, titlefontsize=9,
-                    xscale=use_log ? :log10 : :identity,
-                    tickfontsize=6, labelfontsize=7)
     end
-
-    for j in (n + 1):(nrows * ncols)
-        Plots.plot!(fig[j], axis=([], false), grid=false)
+    m[1] = ((2 * h[1] + h[2]) * d[1] - h[1] * d[2]) / (h[1] + h[2])
+    sign(m[1]) != sign(d[1]) && (m[1] = 0.0)
+    sign(d[1]) != sign(d[2]) && abs(m[1]) > abs(3 * d[1]) && (m[1] = 3 * d[1])
+    m[n] = ((2 * h[end] + h[end - 1]) * d[end] - h[end] * d[end - 1]) / (h[end] + h[end - 1])
+    sign(m[n]) != sign(d[end]) && (m[n] = 0.0)
+    sign(d[end]) != sign(d[end - 1]) && abs(m[n]) > abs(3 * d[end]) && (m[n] = 3 * d[end])
+    out = Vector{Float64}(undef, length(xs))
+    for (j, xi) in enumerate(xs)
+        k = clamp(searchsortedlast(x, xi), 1, n - 1)
+        t = (xi - x[k]) / h[k]
+        h00 = 2t^3 - 3t^2 + 1
+        h10 = t^3 - 2t^2 + t
+        h01 = -2t^3 + 3t^2
+        h11 = t^3 - t^2
+        out[j] = h00 * y[k] + h10 * h[k] * m[k] + h01 * y[k + 1] + h11 * h[k] * m[k + 1]
     end
-
-    ref_loss = profiles[1].best_loss
-    threshold = profiles[1].threshold
-    Plots.plot!(fig, plot_title="$title | ref loss=$(round(ref_loss, digits=2)) | " *
-                                "threshold=$(round(threshold, digits=2)) | " *
-                                "identifiable=$n_ident/$n",
-                plot_titlefontsize=11)
-
-    if filename !== nothing
-        Plots.savefig(fig, filename)
-    end
-    return fig
+    return out
 end
 
-"""
-    plot_cp_profiles(cp_profiles::Vector{CPProfileResult}, threshold::Real;
-                     filename=nothing, title="Changepoint profile curves")
-
-Create a multi-panel figure of changepoint-location profile curves.
-
-Each subplot shows the discrete loss profile (steel-blue line with markers), the
-reference loss threshold (crimson dashed horizontal line), the detected
-changepoint (dark-green dashed vertical line), and the confidence-set bounds
-(gold dashed vertical lines)."""
-function plot_cp_profiles(cp_profiles::Vector{CPProfileResult}, threshold::Real;
-                          filename=nothing,
-                          title::String="Changepoint profile curves")
-    if !isdefined(Main, :Plots)
-        error("plot_cp_profiles requires Plots.jl to be loaded in the calling environment")
-    end
-    Plots = Main.Plots
-    n = length(cp_profiles)
-    ncols = min(4, n)
-    nrows = ceil(Int, n / ncols)
-    fig = Plots.plot(layout=(nrows, ncols), size=(400 * ncols, 300 * nrows),
-                     framestyle=:box, grid=true, gridalpha=0.3)
-
-    n_ident = 0
-    for (i, cp) in enumerate(cp_profiles)
-        cands = cp.candidate_cps
-        los = cp.losses
-        lo, hi, id = cp_ci(cp, Float64(threshold))
-        id && (n_ident += 1)
-
-        perm = sortperm(cands)
-        cands = cands[perm]
-        los = los[perm]
-
-        Plots.plot!(fig[i], cands, los, seriestype=:path,
-                    color=:steelblue, lw=1.5, label="")
-        Plots.scatter!(fig[i], cands, los, markersize=3, color=:steelblue,
-                       label="")
-        Plots.hline!(fig[i], [threshold], color=:crimson, ls=:dash, lw=0.8,
-                     label="")
-        Plots.vline!(fig[i], [cp.original_cp], color=:darkgreen, ls=:dash, lw=1.0,
-                     label="")
-        if !ismissing(lo) && !ismissing(hi)
-            Plots.vline!(fig[i], [lo], color=:gold, ls=:dash, lw=1.5, label="")
-            Plots.vline!(fig[i], [hi], color=:gold, ls=:dash, lw=1.5, label="")
-        end
-
-        ci_text = ismissing(lo) ? "CI = [-, -]" : "CI = [$lo, $hi]"
-        Plots.plot!(fig[i], xlabel="candidate changepoint", ylabel="loss",
-                    title="CP $(cp.cp_index) (original=$(cp.original_cp))\n$ci_text, identifiable=$id",
-                    titlefontsize=9, tickfontsize=6, labelfontsize=7)
-    end
-
-    for j in (n + 1):(nrows * ncols)
-        Plots.plot!(fig[j], axis=([], false), grid=false)
-    end
-
-    Plots.plot!(fig, plot_title="$title | threshold=$(round(Float64(threshold), digits=2)) | " *
-                                "identifiable=$n_ident/$n",
-                plot_titlefontsize=11)
-
-    if filename !== nothing
-        Plots.savefig(fig, filename)
-    end
-    return fig
-end
+"""Plot parameter and changepoint profiles in a 2 × 4 layout when Plots.jl is loaded."""
+function plot_profile_panels end
 
 """    write_summary(path, summary_df)
 

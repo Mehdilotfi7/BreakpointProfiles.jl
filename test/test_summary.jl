@@ -69,12 +69,3 @@ end
     # Just check that printing does not error
     @test_nowarn print_summary_table(summary_df)
 end
-
-@testset "plot_profiles requires Plots" begin
-    prof = synthetic_profile(
-        "x", 1, 1.0, 0.0, 0.8, 1.2, true,
-        [0.8, 1.0, 1.2],
-        [1.0, 0.0, 1.0]
-    )
-    @test_throws ErrorException plot_profiles([prof])
-end
