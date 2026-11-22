@@ -11,4 +11,5 @@ using Test
     include("test_summary.jl")
     include("test_plotting.jl")
     include("test_ple_sanity.jl")
+    include("test_regressions.jl")
 end

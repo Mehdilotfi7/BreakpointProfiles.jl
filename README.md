@@ -20,11 +20,12 @@ The adaptive profile-likelihood engine and the confidence-interval extraction in
 
 ## Installation
 
-Install the registered package with:
+The package is not yet registered in the Julia General registry. Install it
+from GitHub:
 
 ```julia
 using Pkg
-Pkg.add("BreakpointProfiles")
+Pkg.add(url="https://github.com/Mehdilotfi7/BreakpointProfiles.jl")
 ```
 
 Or clone the repository and develop it locally:
@@ -127,18 +128,61 @@ profiling method or confidence threshold.
 - **Conditional profile likelihood** for continuous parameters (changepoints fixed).
 - **Joint profile likelihood** for continuous parameters (changepoints treated as discrete nuisance variables and re-optimised).
 - **Changepoint-location profiling** with re-optimisation of all other parameters.
-- Adaptive profile-likelihood grids with bound handling.
+- D2D-style adaptive stepping (path extrapolation, trial-step control,
+  jump smoothing) with bisection refinement of every threshold crossing.
 - Multiple optimiser backends: GA (Evolutionary.jl), differential evolution (Metaheuristics.jl), LBFGS (Optim.jl), BOBYQA (NLopt.jl), and multi-start/hybrid pipelines.
 - Likelihood options: Gaussian (L2), Laplace (L1), log-scale, and custom losses.
 - Identifiability assessment and confidence-interval extraction.
 - CSV/DataFrame export, Markdown reports, and plotting utilities.
 
-## L2 vs L1 losses and thresholds
+## Losses and thresholds
 
-- **Gaussian (L2) losses:** Wilks' theorem applies; use the standard χ² threshold
-  (`best_loss + 3.8415` for 1 df, 95%).
+The loss must be `-2 log L` of the observation model for the χ²₁ threshold
+(`delta = 3.8415`, 95%) to be meaningful, and it should be the same likelihood
+that was used to detect the changepoints (loss consistency).
+
+- `GaussianNLL(σ)`: Gaussian errors with known per-channel σ,
+  `Σ ((sim - data)/σ)²`.
+- `ProfiledGaussianNLL()`: Gaussian errors with one unknown σ profiled out,
+  `N log(RSS/N)` — the likelihood implied by the MICA BIC.
+- `GaussianLogNLL(σ)`, `GaussianLogLikelihood(σ)`: Gaussian errors on log scale.
+- **Raw RSS** equals `-2 log L` only if σ = 1; otherwise intervals are wrong
+  by a factor σ.
 - **Laplace (L1) losses:** Wilks' theorem does not apply. Pass a user-derived
-  threshold to `profile_parameter(...; threshold=...)`.
+  `delta` (or absolute `threshold`).
+
+The threshold is `reference_loss + delta`. By default the reference fit is
+re-optimised before profiling (`ProfileOptions(refit_reference=true)`), and if
+a profile finds a better optimum the reference is replaced and all profiles
+are recomputed (`allow_better_optimum=true`).
+
+## Changepoints in the generic ODE path
+
+When `ode_function` is used instead of `objective`, segment `j` is integrated
+with `p = [θ_global; θ_segment_j]` (the `n_global` global parameters followed
+by the `n_segment_specific` parameters of that segment) and the state is
+carried over continuously at each changepoint. The right-hand side therefore
+never needs to know the changepoint locations, and moving a changepoint
+changes the dynamics.
+
+## Changepoint uncertainty
+
+- `profile_changepoint` / `profile_all_changepoints`: discrete profile of one
+  changepoint location (`window`, `min_seg`).
+- `cp_confidence_set`: all locations below the threshold, the contiguous
+  component around the minimum, secondary components, and whether the set is
+  censored by the profiling window (`identifiable == false` in that case).
+- `profile_parameter_joint`: the changepoints are profiled out over the fixed
+  search set `CPSearchSpace(detected, window, n_obs; step, min_seg)`, either
+  exhaustively (`cp_search=:grid`) or by coordinate search
+  (`cp_search=:local`, for many changepoints). Admissible secondary
+  changepoint configurations are tracked, so disconnected confidence regions
+  are reported (`profile_confidence_intervals`).
+
+The χ²₁ calibration of changepoint-location sets is heuristic because a
+discrete changepoint location is a non-regular parameter; in simulation
+studies it gives close to nominal coverage, but a parametric bootstrap is the
+rigorous alternative.
 
 
 ## Citation

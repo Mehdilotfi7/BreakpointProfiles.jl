@@ -26,12 +26,12 @@ day 20, respectively. Both use residual-sum-of-squares objectives and the
 
 | Analysis | Quantity | Estimate | Approximate 95% interval |
 |---|---|---:|---:|
-| Baseline | `u0` | 5.0 | [4.467, 5.533] |
-| Baseline | `r` | 0.2 | [0.182, 0.218] |
-| Conditional | `u0` | 5.0 | [4.231, 5.769] |
+| Baseline | `u0` | 5.0 | [4.459, 5.541] |
+| Baseline | `r` | 0.2 | [0.181, 0.219] |
+| Conditional | `u0` | 5.0 | [4.225, 5.775] |
 | Conditional | `r1` | 0.2 | [0.146, 0.254] |
-| Conditional | `r2` | 0.5 | [0.468, 0.532] |
-| Joint | `u0` | 5.0 | [4.182, 5.843] |
+| Conditional | `r2` | 0.5 | [0.466, 0.534] |
+| Joint | `u0` | 5.0 | [4.182, 5.844] |
 | Changepoint location | day | 20 | [16, 24] |
 
 The joint interval for `u0` is wider than the conditional interval because the
@@ -39,6 +39,22 @@ changepoint location is estimated rather than held fixed. The changepoint
 profile reaches its minimum at day 20, and its sub-threshold region contains
 the true transition. These are validation examples with known answers, not
 estimates of runtime or performance on large models.
+
+### Baseline profiles
+
+![Baseline parameter profile-likelihood curves](assets/examples/baseline_profiles.png)
+
+### Conditional profiles
+
+![Conditional parameter profile-likelihood curves with the changepoint fixed](assets/examples/conditional_profiles.png)
+
+### Changepoint-location profile
+
+![Profile likelihood for the changepoint location](assets/examples/changepoint_profile.png)
+
+### Joint profile
+
+![Joint profile likelihood with the changepoint re-optimized](assets/examples/joint_profile.png)
 
 ## Analytic piecewise-linear ODE (test model)
 

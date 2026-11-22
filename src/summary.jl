@@ -14,9 +14,15 @@ function ple_summary(profiles::Vector{ProfileResult})
         threshold = Float64[],
         relative_width = Float64[],
         n_failed = Int[],
-        best_found_loss = Float64[]
+        best_found_loss = Float64[],
+        n_ci_components = Int[],
+        ci_hull_lower = Float64[],
+        ci_hull_upper = Float64[]
     )
     for p in profiles
+        comps = profile_confidence_intervals(p)
+        hull_lo = isempty(comps) ? p.ci_lower : min(p.ci_lower, minimum(first.(comps)))
+        hull_hi = isempty(comps) ? p.ci_upper : max(p.ci_upper, maximum(last.(comps)))
         rel_width = if p.best_value != 0
             (p.ci_upper - p.ci_lower) / abs(p.best_value)
         else
@@ -25,31 +31,41 @@ function ple_summary(profiles::Vector{ProfileResult})
         push!(df, (
             p.parameter, p.index, p.best_value, p.best_loss,
             p.ci_lower, p.ci_upper, p.identifiable, p.threshold, rel_width,
-            p.n_failed, p.best_found_loss
+            p.n_failed, p.best_found_loss, length(comps), hull_lo, hull_hi
         ))
     end
     return df
 end
 
 """
-    cp_summary(cp_profiles::Vector{CPProfileResult}, threshold)
+    cp_summary(cp_profiles::Vector{CPProfileResult}[, threshold]; delta=3.8415)
 
-Return a `DataFrame` summarising changepoint profile intervals."""
-function cp_summary(cp_profiles::Vector{CPProfileResult}, threshold::Float64)
+Return a `DataFrame` summarising changepoint confidence sets. If `threshold`
+is omitted each profile uses its own reference `best_loss + delta`. Columns:
+`cp_index, original_cp, best_cp, ci_lower, ci_upper, identifiable,
+censored_lower, censored_upper, n_components, confidence_set`."""
+function cp_summary(cp_profiles::Vector{CPProfileResult}, threshold::Union{Real,Nothing}=nothing;
+                    delta::Real=CHISQ_95)
     df = DataFrame(
         cp_index = Int[],
         original_cp = Int[],
+        best_cp = Int[],
         ci_lower = Int[],
         ci_upper = Int[],
-        identifiable = Bool[]
+        identifiable = Bool[],
+        censored_lower = Bool[],
+        censored_upper = Bool[],
+        n_components = Int[],
+        confidence_set = String[]
     )
     for cp in cp_profiles
-        lo, hi, id = cp_ci(cp, threshold)
-        if ismissing(lo)
-            push!(df, (cp.cp_index, cp.original_cp, 0, 0, false))
-        else
-            push!(df, (cp.cp_index, cp.original_cp, lo, hi, id))
-        end
+        cs = cp_confidence_set(cp, threshold; delta=delta)
+        push!(df, (cp.cp_index, cp.original_cp,
+                   ismissing(cs.best_cp) ? 0 : cs.best_cp,
+                   ismissing(cs.lower) ? 0 : cs.lower,
+                   ismissing(cs.upper) ? 0 : cs.upper,
+                   cs.identifiable, cs.censored_lower, cs.censored_upper,
+                   length(cs.components), join(cs.set, ";")))
     end
     return df
 end
@@ -142,12 +158,13 @@ function print_summary_table(summary_df::DataFrame)
 end
 
 """
-    write_report(out_dir, profiles, cp_profiles=nothing)
+    write_report(out_dir, profiles; cp_profiles=nothing, cp_delta=3.8415)
 
-Write a Markdown report, summary CSV, and profile curves CSV for a completed PLE
-analysis."""
-function write_report(out_dir::String, profiles::Vector{ProfileResult};
-                    cp_profiles::Union{Vector{CPProfileResult},Nothing}=nothing)
+Write `ple_summary.csv`, `ple_results.csv` (+ curves), optionally the
+changepoint profile files, and a Markdown report `ple_report.md`."""
+function write_report(out_dir::AbstractString, profiles::Vector{ProfileResult};
+                      cp_profiles::Union{Vector{CPProfileResult},Nothing}=nothing,
+                      cp_delta::Real=CHISQ_95)
     mkpath(out_dir)
     summary_df = ple_summary(profiles)
     write_summary(joinpath(out_dir, "ple_summary.csv"), summary_df)
@@ -156,30 +173,37 @@ function write_report(out_dir::String, profiles::Vector{ProfileResult};
     lines = String[]
     push!(lines, "# Profile-likelihood analysis")
     push!(lines, "")
+    if !isempty(profiles)
+        push!(lines, @sprintf("Reference loss: %.6g; threshold: %.6g (Δ = %.4g)",
+                              profiles[1].best_loss, profiles[1].threshold,
+                              profiles[1].threshold - profiles[1].best_loss))
+        push!(lines, "")
+    end
     push!(lines, "| parameter | best value | CI lower | CI upper | identifiable |")
     push!(lines, "|---|---|---|---|---|")
     for r in eachrow(summary_df)
-        @printf(lines[end], "| %s | %.5g | %.5g | %.5g | %s |",
-                r.parameter, r.best_value, r.ci_lower, r.ci_upper, r.identifiable)
+        push!(lines, @sprintf("| %s | %.5g | %.5g | %.5g | %s |",
+                              r.parameter, r.best_value, r.ci_lower, r.ci_upper, r.identifiable))
     end
 
     if cp_profiles !== nothing
-        threshold = profiles[1].threshold
-        cp_df = cp_summary(cp_profiles, threshold)
+        cp_df = cp_summary(cp_profiles; delta=cp_delta)
         write_cp_profiles(joinpath(out_dir, "cp_profile_loss.csv"), cp_profiles)
         CSV.write(joinpath(out_dir, "cp_profile_ci.csv"), cp_df)
         push!(lines, "")
-        push!(lines, "## Changepoint profile intervals")
+        push!(lines, "## Changepoint confidence sets")
         push!(lines, "")
-        push!(lines, "| cp | original | CI lower | CI upper | identifiable |")
-        push!(lines, "|---|---|---|---|---|")
+        push!(lines, "| cp | detected | best | CI lower | CI upper | bounded | set |")
+        push!(lines, "|---|---|---|---|---|---|---|")
         for r in eachrow(cp_df)
-            @printf(lines[end], "| %d | %d | %d | %d | %s |",
-                    r.cp_index, r.original_cp, r.ci_lower, r.ci_upper, r.identifiable)
+            push!(lines, @sprintf("| %d | %d | %d | %d | %d | %s | %s |",
+                                  r.cp_index, r.original_cp, r.best_cp, r.ci_lower,
+                                  r.ci_upper, r.identifiable, r.confidence_set))
         end
     end
 
     open(joinpath(out_dir, "ple_report.md"), "w") do f
         write(f, join(lines, "\n") * "\n")
     end
+    return joinpath(out_dir, "ple_report.md")
 end

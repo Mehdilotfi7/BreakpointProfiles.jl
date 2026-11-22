@@ -68,6 +68,63 @@ function (c::CustomLoss)(sim, data)
 end
 
 """
+    GaussianNLL(σ)
+
+Gaussian negative log-likelihood on the original (linear) scale with known
+noise standard deviation, on the `-2 log L` scale (constants omitted):
+
+    Σ_k Σ_t ((sim_k(t) - data_k(t)) / σ_k)²
+
+`σ` may be a scalar or one value per data channel. With known σ the χ²₁
+threshold 3.8415 gives approximate 95% profile-likelihood intervals."""
+struct GaussianNLL <: AbstractLikelihood
+    sigma_per_channel::Vector{Float64}
+end
+GaussianNLL(σ::Real) = GaussianNLL(Float64[σ])
+
+function (ll::GaussianNLL)(sim, data)
+    nch = size(data, 1)
+    total = 0.0
+    for k in 1:nch
+        σ = ll.sigma_per_channel[min(k, length(ll.sigma_per_channel))]
+        inv_σ2 = 1.0 / (σ * σ)
+        for t in 1:size(data, 2)
+            d = data[k, t]
+            isnan(d) && continue
+            r = sim[k, t] - d
+            total += r * r * inv_σ2
+        end
+    end
+    return total
+end
+
+"""
+    ProfiledGaussianNLL()
+
+Gaussian `-2 log L` with a common unknown σ profiled out analytically:
+
+    N · log(RSS / N)
+
+where `RSS` is the residual sum of squares over all non-missing observations
+and `N` their number. This is the likelihood implied by the MICA BIC
+`N log(RSS/N) + p log N`, so detection and profiling use the same likelihood;
+the χ²₁ threshold applies directly on this scale."""
+struct ProfiledGaussianNLL <: AbstractLikelihood end
+
+function (::ProfiledGaussianNLL)(sim, data)
+    rss = 0.0
+    n = 0
+    for k in 1:size(data, 1), t in 1:size(data, 2)
+        d = data[k, t]
+        isnan(d) && continue
+        r = sim[k, t] - d
+        rss += r * r
+        n += 1
+    end
+    return n * log(max(rss, floatmin(Float64)) / n)
+end
+
+"""
     GaussianLogNLL
 
 Gaussian negative log-likelihood on log-transformed multi-channel data, scaled
@@ -154,38 +211,65 @@ function chi2_threshold(df::Int=1, alpha::Float64=0.95)
 end
 
 """
-    evaluate_loss(prob::ODEChangepointPLEProblem, params)
+    evaluate_loss(prob::ODEChangepointPLEProblem, params[, cps])
 
-Evaluate the loss for `params` using the problem's objective, simulator, or
-generic ODE solver, in that order of priority."""
-function evaluate_loss(prob::ODEChangepointPLEProblem, params::Vector{Float64})
-    if prob.objective !== nothing
-        return prob.objective(params, prob.changepoints)
+Evaluate the loss for `params` at the changepoint vector `cps` (default:
+`prob.changepoints`) using the problem's objective, simulator, or generic ODE
+solver, in that order of priority. Non-finite results are mapped to `Inf`."""
+evaluate_loss(prob::ODEChangepointPLEProblem, params::AbstractVector) =
+    evaluate_loss(prob, params, prob.changepoints)
+
+function evaluate_loss(prob::ODEChangepointPLEProblem, params::AbstractVector, cps::AbstractVector{<:Integer})
+    θ = collect(Float64, params)
+    c = collect(Int, cps)
+    loss = if prob.objective !== nothing
+        prob.objective(θ, c)
     elseif prob.simulator !== nothing
-        sim = prob.simulator(params, prob.changepoints)
-        return prob.loss_fn(sim, prob.data)
+        sim = prob.simulator(θ, c)
+        prob.loss_fn(sim, prob.data)
     elseif prob.ode_function !== nothing
-        sim = solve_segments(prob, params)
-        if any(isnan, sim)
-            return Inf
-        end
-        return prob.loss_fn(sim, prob.data)
+        sim = solve_segments(prob, θ, c)
+        any(isnan, sim) ? Inf : prob.loss_fn(sim, prob.data)
     else
         error("ODEChangepointPLEProblem has no objective, simulator, or ode_function")
     end
+    return isfinite(loss) ? Float64(loss) : Inf
 end
 
-function solve_segments(prob, params)
+"""
+    segment_parameters(prob, params, j)
+
+Return the parameter vector `[θ_global; θ_segment_j]` passed to the ODE
+right-hand side inside segment `j` (1-based)."""
+function segment_parameters(prob::ODEChangepointPLEProblem, params::AbstractVector, j::Int)
+    ng, ns = prob.n_global, prob.n_segment_specific
+    ns == 0 && return collect(Float64, params[1:ng])
+    return vcat(params[1:ng], params[(ng + (j - 1) * ns + 1):(ng + j * ns)])
+end
+
+"""
+    solve_segments(prob, params[, cps])
+
+Integrate `prob.ode_function` piecewise between the changepoints. Segment `j`
+(the interval between the `(j-1)`-th and `j`-th changepoint) is integrated with
+`segment_parameters(prob, params, j)`, and the state is carried over
+continuously across each changepoint. Returns a `states × time` matrix sampled
+at integer time steps on `prob.tspan`."""
+function solve_segments(prob, params, cps::AbstractVector{<:Integer}=prob.changepoints)
     t0, tf = prob.tspan
-    cps = filter(cp -> t0 < cp < tf, sort(Float64.(prob.changepoints)))
+    cps_all = sort(Float64.(collect(cps)))
+    n_cols = Int(ceil(tf - t0)) + 1
+    nan_out = fill(NaN, length(prob.u0), n_cols)
 
     u0 = copy(prob.u0)
     t_start = t0
     parts = Matrix{Float64}[]
 
-    for cp in cps
-        sol = _solve_segment(prob, u0, (t_start, cp), params)
-        any(isnan, sol) && return fill(NaN, length(prob.u0), Int(ceil(tf - t0)) + 1)
+    for cp in cps_all
+        t0 < cp < tf || continue
+        j = 1 + count(<=(t_start), cps_all)
+        sol = _solve_segment(prob, u0, (t_start, cp), segment_parameters(prob, params, j))
+        any(isnan, sol) && return nan_out
         if size(sol, 2) > 1
             push!(parts, sol[:, 1:end-1])
         end
@@ -193,24 +277,30 @@ function solve_segments(prob, params)
         t_start = cp
     end
 
-    sol = _solve_segment(prob, u0, (t_start, tf), params)
-    any(isnan, sol) && return fill(NaN, length(prob.u0), Int(ceil(tf - t0)) + 1)
+    j = 1 + count(<=(t_start), cps_all)
+    sol = _solve_segment(prob, u0, (t_start, tf), segment_parameters(prob, params, j))
+    any(isnan, sol) && return nan_out
     push!(parts, sol)
 
     return reduce(hcat, parts)
 end
 
-function _solve_segment(prob, u0, tspan, params)
-    ode_prob = ODEProblem(prob.ode_function, u0, tspan, params)
-    sol = solve(
-        ode_prob, Tsit5(),
-        saveat = 1.0,
-        abstol = 1e-6,
-        reltol = 1e-6,
-        isoutofdomain = (u, p, t) -> any(x -> x < 0, u)
-    )
-    mat = hcat(sol.u...)
+function _solve_segment(prob, u0, tspan, p)
+    ode_prob = ODEProblem(prob.ode_function, u0, tspan, p)
     expected = Int(ceil(tspan[2] - tspan[1])) + 1
+    sol = try
+        solve(
+            ode_prob, Tsit5(),
+            saveat = 1.0,
+            abstol = 1e-8,
+            reltol = 1e-6,
+            isoutofdomain = (u, p, t) -> any(x -> x < 0, u),
+            verbose = false
+        )
+    catch
+        return fill(NaN, length(u0), expected)
+    end
+    mat = hcat(sol.u...)
     if any(isnan, mat) || size(mat, 2) != expected
         return fill(NaN, length(u0), expected)
     end

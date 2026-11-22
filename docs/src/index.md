@@ -18,15 +18,17 @@ The package can work with any model that exposes one of the following:
 
 * an objective function `(params, changepoints) -> loss`;
 * a simulator `(params, changepoints) -> simulation_matrix` plus a loss function;
-* a plain ODE right-hand side `(du, u, p, t)` plus initial condition and time span.
+* a plain ODE right-hand side `(du, u, p, t)` plus initial condition and time span;
+  inside segment `j` the solver passes `p = [θ_global; θ_segment_j]`.
 
 ## Installation
 
-Install the registered package with:
+The package is not yet registered in the Julia General registry. Install it
+from GitHub:
 
 ```julia
 using Pkg
-Pkg.add("BreakpointProfiles")
+Pkg.add(url="https://github.com/Mehdilotfi7/BreakpointProfiles.jl")
 ```
 
 ## Quick start

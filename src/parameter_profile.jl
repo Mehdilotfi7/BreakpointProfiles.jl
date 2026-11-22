@@ -1,525 +1,583 @@
 const CHISQ_95 = 3.8414588206941285
 
+# =============================================================================
+# Generic profiling engine
+# =============================================================================
+#
+# The conditional profile (changepoints fixed) and the joint profile
+# (changepoints re-optimised on a fixed discrete grid) are computed by the same
+# engine. They differ only in the *inner solver*
+#
+#     inner(value, warm_params, warm_cps) -> (loss, params, cps)
+#
+# which minimises the loss over all nuisance quantities with parameter `idx`
+# fixed to `value`, starting from a warm start.
+
+struct _ProfileTrace
+    values::Vector{Float64}
+    losses::Vector{Float64}
+    params::Vector{Vector{Float64}}
+    cps::Vector{Vector{Int}}
+end
+
+_ProfileTrace() = _ProfileTrace(Float64[], Float64[], Vector{Float64}[], Vector{Int}[])
+
+function _trace_push!(tr::_ProfileTrace, v, l, θ, cps)
+    push!(tr.values, v)
+    push!(tr.losses, l)
+    push!(tr.params, copy(θ))
+    push!(tr.cps, collect(Int, cps))
+    return tr
+end
+
+function _trace_sort!(tr::_ProfileTrace)
+    perm = sortperm(tr.values)
+    permute!(tr.values, perm)
+    permute!(tr.losses, perm)
+    permute!(tr.params, perm)
+    permute!(tr.cps, perm)
+    return tr
+end
+
+_with_value(θ, idx, v) = (x = collect(Float64, θ); x[idx] = v; x)
+
+"""Copy of `opts` with the given fields replaced."""
+function _with_options(opts::ProfileOptions; kwargs...)
+    vals = Any[get(kwargs, f, getfield(opts, f)) for f in fieldnames(ProfileOptions)]
+    return ProfileOptions(vals...)
+end
+
+"""Copy of `prob` with a new reference fit (and optionally new changepoints)."""
+function _with_reference(prob::ODEChangepointPLEProblem, params, loss;
+                         changepoints=prob.changepoints)
+    return ODEChangepointPLEProblem(
+        prob.objective, prob.simulator, prob.ode_function, prob.u0, prob.tspan,
+        prob.data, prob.loss_fn, collect(Int, changepoints),
+        collect(Float64, params), Float64(loss), prob.lb, prob.ub,
+        prob.param_names, prob.n_global, prob.n_segment_specific, prob.n_obs)
+end
+
+function _assemble(n, idx, fixed_val, free, x_free)
+    θ = Vector{Float64}(undef, n)
+    θ[idx] = fixed_val
+    θ[free] .= x_free
+    return θ
+end
+
+"""
+    _build_loss_free(prob, idx, fixed_val, free[, cps])
+
+Loss over the free parameters with parameter `idx` fixed to `fixed_val`."""
+function _build_loss_free(prob, idx, fixed_val, free, cps=prob.changepoints)
+    n = length(prob.best_params)
+    c = collect(Int, cps)
+    return x_free -> evaluate_loss(prob, _assemble(n, idx, fixed_val, free, x_free), c)
+end
+
+"""
+    _optimize_fixed(prob, idx, value, cps, warm, optimizer)
+
+Minimise over all parameters except `idx` (fixed to `value`) at the changepoint
+vector `cps`, starting from `warm`. The returned loss is never worse than the
+loss at the warm start, which guards against stochastic optimisers returning a
+worse point than their initial guess. Returns `(loss, params_full)`."""
+function _optimize_fixed(prob, idx, value, cps, warm, optimizer)
+    n = length(prob.best_params)
+    free = setdiff(1:n, idx)
+    lb = prob.lb[free]
+    ub = prob.ub[free]
+    f = _build_loss_free(prob, idx, value, free, cps)
+    x0 = clamp.(collect(Float64, warm[free]), lb, ub)
+    l0 = f(x0)
+    loss, x = try
+        optimize_ple(f, x0, lb, ub, optimizer)
+    catch e
+        @debug "Inner optimisation failed for parameter $idx at $value" exception = e
+        (Inf, x0)
+    end
+    loss = (loss isa Real && isfinite(loss)) ? Float64(loss) : Inf
+    if !(loss <= l0)
+        loss, x = l0, x0
+    end
+    return loss, _assemble(n, idx, value, free, collect(Float64, x))
+end
+
+"""Inner solver for the conditional profile: changepoints fixed."""
+function _conditional_inner(prob, idx, optimizer)
+    cps = collect(Int, prob.changepoints)
+    return function (value, warm, warm_cps)
+        local loss, θ = _optimize_fixed(prob, idx, value, cps, warm, optimizer)
+        return loss, θ, cps
+    end
+end
+
+function _initial_step(best_val, range_width, min_step, max_step)
+    step0 = best_val != 0 ? min(range_width / 50.0, abs(best_val) * 0.05) : range_width / 50.0
+    return clamp(step0, min_step, max_step)
+end
+
+"""
+    _profile_engine(prob, idx, ref_params, ref_cps, ref_loss, margin, inner, options;
+                    samplesize=options.samplesize)
+
+D2D-style adaptive profile (Raue et al. 2009; Data2Dynamics `ple.m`).
+
+For each direction:
+1. Propose `value ± step`.
+2. Trial step: evaluate the loss at the proposal with all nuisance quantities
+   held at the *current* profile point (no re-optimisation) and shrink the step
+   by `step_factor` until the increase relative to the current point is at
+   most `rel_step_increase * margin`.
+3. Re-optimise the nuisance quantities with `inner` and record the point.
+4. Enlarge the step by `step_factor` and continue until the profile exceeds
+   `stop_margin_factor * margin` above the reference or a bound is hit.
+
+`reach = (lo, hi)` forces the lower (upper) direction to continue at least to
+`lo` (`hi`) even after the threshold has been exceeded; it is used by the joint
+profile to reach admissible secondary modes so that disconnected confidence
+regions are not missed.
+
+Afterwards local jumps are smoothed (D2D `pleSmooth`), each threshold crossing
+is refined by bisection, and the CI is read off the refined profile.
+Returns `(ProfileResult, trace)`."""
+function _profile_engine(prob, idx, ref_params, ref_cps, ref_loss, margin, inner,
+                         options::ProfileOptions; samplesize::Int=options.samplesize,
+                         reach::Tuple{Float64,Float64}=(Inf, -Inf))
+    margin > 0 || error("profile threshold margin must be positive (got $margin)")
+    best_val = ref_params[idx]
+    lower_bound = prob.lb[idx]
+    upper_bound = prob.ub[idx]
+    range_width = upper_bound - lower_bound
+    threshold = ref_loss + margin
+
+    min_step = max(range_width * options.min_step_factor, 1e-12)
+    max_step = max(range_width * options.max_step_factor, min_step)
+    step0 = _initial_step(best_val, range_width, min_step, max_step)
+
+    tr = _ProfileTrace()
+    _trace_push!(tr, best_val, ref_loss, ref_params, ref_cps)
+    n_failed = 0
+
+    for direction in (-1.0, 1.0)
+        n_failed += _engine_direction!(tr, prob, idx, ref_params, ref_cps, ref_loss,
+                                       margin, inner, options, direction, step0,
+                                       min_step, max_step, samplesize,
+                                       direction < 0 ? reach[1] : reach[2])
+    end
+    _trace_sort!(tr)
+
+    if options.smooth_jumps && length(tr.values) >= 3
+        _engine_smooth!(tr, idx, inner, options.jump_tol * margin)
+    end
+
+    if options.refine_ci
+        _engine_refine_crossings!(tr, idx, inner, best_val, threshold, margin,
+                                  options.ci_refine_iters, range_width * 1e-7)
+    end
+
+    ci_lower, ci_upper, identifiable = ple_ci_interpolated(
+        tr.values, tr.losses, best_val, ref_loss, lower_bound, upper_bound, threshold)
+
+    best_found, imin = findmin(tr.losses)
+    result = ProfileResult(
+        prob.param_names[idx], idx, best_val, ref_loss, ci_lower, ci_upper,
+        identifiable, threshold, copy(tr.values), copy(tr.losses), n_failed,
+        best_found, copy(tr.params[imin]), copy(tr.cps)
+    )
+    return result, tr
+end
+
+function _engine_direction!(tr, prob, idx, ref_params, ref_cps, ref_loss, margin, inner,
+                            options, direction, step0, min_step, max_step, samplesize,
+                            reach_val::Float64=(direction < 0 ? Inf : -Inf))
+    lower_bound = prob.lb[idx]
+    upper_bound = prob.ub[idx]
+    target = options.rel_step_increase * margin
+
+    cur_val = ref_params[idx]
+    cur_params = collect(Float64, ref_params)
+    cur_cps = collect(Int, ref_cps)
+    cur_loss = ref_loss
+    prev_val = NaN
+    prev_params = cur_params
+    step = step0
+    n_failed = 0
+    n_points = 0
+    n_attempts = 0
+
+    # Predicted point at `cand`: move along the profile path by linear
+    # extrapolation from the last two profile points (D2D `pleExtrapolate`);
+    # on the first step only the profiled coordinate moves.
+    predict(cand) = begin
+        local θp = copy(cur_params)
+        if isfinite(prev_val) && cur_val != prev_val
+            θp .+= (cand - cur_val) / (cur_val - prev_val) .* (cur_params .- prev_params)
+            θp .= clamp.(θp, prob.lb, prob.ub)
+        end
+        θp[idx] = cand
+        θp
+    end
+
+    while n_points < samplesize && n_attempts < 2 * samplesize
+        n_attempts += 1
+        # --- trial step: nuisance at the predicted point, no re-optimisation --
+        step = clamp(step, min_step, max_step)
+        cand = cur_val
+        θ_pred = cur_params
+        for redo in 0:options.max_trial_redos
+            cand = clamp(cur_val + direction * step, lower_bound, upper_bound)
+            cand == cur_val && break
+            θ_pred = predict(cand)
+            trial_loss = evaluate_loss(prob, θ_pred, cur_cps)
+            if !(isfinite(trial_loss) && trial_loss - cur_loss <= target)
+                # fall back to the un-extrapolated point if that is better
+                θ_flat = _with_value(cur_params, idx, cand)
+                flat_loss = evaluate_loss(prob, θ_flat, cur_cps)
+                if isfinite(flat_loss) && !(flat_loss >= trial_loss)
+                    θ_pred, trial_loss = θ_flat, flat_loss
+                end
+            end
+            isfinite(trial_loss) && trial_loss - cur_loss <= target && break
+            # Accept the smallest admissible step (as D2D does) rather than
+            # silently truncating the profile.
+            (step <= min_step || redo == options.max_trial_redos) && break
+            step = max(step / options.step_factor, min_step)
+        end
+        cand == cur_val && break
+
+        # --- re-optimise the nuisance quantities ----------------------------
+        loss, θ, cps = inner(cand, θ_pred, cur_cps)
+        if !isfinite(loss)
+            n_failed += 1
+            step <= min_step && break
+            step = max(step / 2, min_step)
+            continue
+        end
+        _trace_push!(tr, cand, loss, θ, cps)
+        n_points += 1
+
+        prev_val, prev_params = cur_val, cur_params
+        cur_val, cur_params, cur_cps, cur_loss = cand, θ, cps, loss
+        # Stop above the threshold, unless a known admissible mode (e.g. another
+        # changepoint configuration of the joint problem) lies further out.
+        beyond = direction < 0 ? cand <= reach_val : cand >= reach_val
+        loss - ref_loss > options.stop_margin_factor * margin && beyond && break
+        (cand <= lower_bound || cand >= upper_bound) && break
+        step *= options.step_factor
+    end
+    return n_failed
+end
+
+"""
+    _engine_smooth!(tr, idx, inner, tol)
+
+D2D `pleSmooth` equivalent. Walking outward from the profile minimum the
+profile should not decrease; if a point is higher than its *outer* neighbour by
+more than `tol`, it is re-optimised warm-started from the outer neighbour's
+optimum (the inner point was trapped in a worse local optimum). Improvements
+propagate inward. Repeated until no point improves (at most 5 sweeps)."""
+function _engine_smooth!(tr, idx, inner, tol)
+    _trace_sort!(tr)
+    n = length(tr.values)
+    for _ in 1:5
+        improved = false
+        _, imin = findmin(tr.losses)
+        # left side: outer neighbour of k is k-1
+        for k in 2:(imin - 1)
+            improved |= _smooth_point!(tr, idx, inner, k, k - 1, tol)
+        end
+        # right side: outer neighbour of k is k+1
+        for k in (n - 1):-1:(imin + 1)
+            improved |= _smooth_point!(tr, idx, inner, k, k + 1, tol)
+        end
+        improved || break
+    end
+    return tr
+end
+
+function _smooth_point!(tr, idx, inner, k, from, tol)
+    isfinite(tr.losses[from]) || return false
+    tr.losses[k] > tr.losses[from] + tol || return false
+    loss, θ, cps = inner(tr.values[k], _with_value(tr.params[from], idx, tr.values[k]), tr.cps[from])
+    if loss < tr.losses[k] - 1e-10
+        tr.losses[k] = loss
+        tr.params[k] = θ
+        tr.cps[k] = collect(Int, cps)
+        return true
+    end
+    return false
+end
+
+"""
+    _engine_refine_crossings!(tr, idx, inner, best_val, threshold, margin, iters, vtol)
+
+Refine every threshold crossing of the profile by bisection.
+Each midpoint is re-optimised warm-started from the inside bracket point, so
+the final CI endpoint is accurate to the bracket width rather than to the
+spacing of the adaptive profile grid."""
+function _engine_refine_crossings!(tr, idx, inner, best_val, threshold, margin, iters, vtol)
+    _trace_sort!(tr)
+    n = length(tr.values)
+    n < 2 && return tr
+    # every adjacent pair straddling the threshold: (inside, outside)
+    brackets = Tuple{Int,Int}[]
+    for i in 1:(n - 1)
+        a, b = tr.losses[i], tr.losses[i + 1]
+        (isfinite(a) && isfinite(b)) || continue
+        if a <= threshold < b
+            push!(brackets, (i, i + 1))
+        elseif b <= threshold < a
+            push!(brackets, (i + 1, i))
+        end
+    end
+    new_points = Tuple{Float64,Float64,Vector{Float64},Vector{Int}}[]
+    for (iin, iout) in brackets
+        vin, vout = tr.values[iin], tr.values[iout]
+        pin, cin = tr.params[iin], tr.cps[iin]
+        for _ in 1:iters
+            abs(vout - vin) <= vtol && break
+            mid = 0.5 * (vin + vout)
+            loss, θ, cps = inner(mid, _with_value(pin, idx, mid), cin)
+            isfinite(loss) || break
+            push!(new_points, (mid, loss, θ, collect(Int, cps)))
+            if loss <= threshold
+                vin, pin, cin = mid, θ, cps
+            else
+                vout = mid
+            end
+            abs(loss - threshold) <= 1e-3 * margin && break
+        end
+    end
+    for (v, l, θ, c) in new_points
+        _trace_push!(tr, v, l, θ, c)
+    end
+    _trace_sort!(tr)
+    return tr
+end
+
+# =============================================================================
+# Reference fit
+# =============================================================================
+
+function _maybe_polish(optimizer::AbstractPLEOptimizer, options::ProfileOptions)
+    return options.polish && !(optimizer isa HybridOptimizerConfig) ?
+           HybridOptimizerConfig(global_optimizer=optimizer) : optimizer
+end
+
+"""
+    refit_reference(prob; optimizer=default_multistart_bobyqa_config(), changepoints=prob.changepoints)
+
+Re-optimise all parameters at fixed changepoints starting from
+`prob.best_params` and return a copy of `prob` whose `best_params` and
+`best_loss` are the improved optimum (never worse than the supplied fit).
+Profiles must be anchored at an optimum; a sub-optimal reference shifts the
+threshold and invalidates every interval."""
+function refit_reference(prob::ODEChangepointPLEProblem;
+                         optimizer::AbstractPLEOptimizer=default_multistart_bobyqa_config(),
+                         changepoints=prob.changepoints)
+    cps = collect(Int, changepoints)
+    f = θ -> evaluate_loss(prob, θ, cps)
+    x0 = clamp.(prob.best_params, prob.lb, prob.ub)
+    l0 = f(x0)
+    loss, x = try
+        optimize_ple(f, x0, prob.lb, prob.ub, optimizer)
+    catch e
+        @warn "Reference re-fit failed: $e"
+        (Inf, x0)
+    end
+    if !(isfinite(loss) && loss < l0)
+        loss, x = l0, x0
+    end
+    return _with_reference(prob, x, loss; changepoints=cps)
+end
+
+"""Verified reference loss, warning if it disagrees with `prob.best_loss`."""
+function _verified_reference_loss(prob)
+    verified = evaluate_loss(prob, prob.best_params)
+    if isfinite(prob.best_loss) &&
+       abs(verified - prob.best_loss) > 1e-6 * max(1.0, abs(prob.best_loss))
+        @warn "Reference loss mismatch: prob.best_loss=$(prob.best_loss), evaluated=$(verified). Using the evaluated value."
+    end
+    isfinite(verified) || error("The loss at prob.best_params is not finite")
+    return verified
+end
+
+"""Threshold margin from an absolute `threshold`, a `delta`, or the χ²₁ default."""
+function _margin(threshold, delta, ref_loss)
+    delta !== nothing && return Float64(delta)
+    threshold !== nothing && return Float64(threshold) - ref_loss
+    return CHISQ_95
+end
+
+# =============================================================================
+# Conditional profile
+# =============================================================================
+
 """
     profile_parameter(prob::ODEChangepointPLEProblem, idx::Int;
                       options=ProfileOptions(),
                       optimizer=default_multistart_bobyqa_config(),
-                      threshold=nothing)
+                      threshold=nothing, delta=nothing)
 
-Profile parameter `idx` by fixing it to a sequence of values and re-optimising all
-other parameters (conditional PLE: changepoints stay fixed).
+Conditional profile likelihood of parameter `idx`: the changepoints are held
+fixed at `prob.changepoints` and all other parameters are re-optimised at each
+profile point.
 
-The profile is constructed with D2D-style adaptive outward stepping:
-* start at the MLE `θ*_i`;
-* step left and right, choosing each step so that the *initial* Δloss at the trial
-  point is a small fraction of the threshold margin;
-* re-optimise the free parameters at each accepted step;
-* stop when the optimised Δloss exceeds the threshold margin or a parameter bound
-  is hit.
+The confidence threshold is `reference_loss + delta`. `delta` defaults to the
+χ²₁ quantile 3.8415 (valid when the loss is `-2 log L` of a correctly specified
+likelihood). Alternatively an absolute `threshold` can be supplied; it is
+converted to a margin relative to the loss at `prob.best_params`.
 
-`options` is a `ProfileOptions` object controlling the D2D stepping, smoothing,
-and better-optimum handling.  `threshold` is the **absolute** loss level that
-defines the confidence interval boundary.  For Gaussian (L2) likelihoods use
-`best_loss + chi2_threshold(1, 0.95)`; for other losses the user must supply
-an appropriate threshold.
-"""
+With `options.refit_reference` the reference is first re-optimised; with
+`options.allow_better_optimum` the profile is restarted from any better optimum
+it discovers (up to `options.max_reference_updates` times)."""
 function profile_parameter(
     prob::ODEChangepointPLEProblem, idx::Int;
     options::ProfileOptions=ProfileOptions(),
     optimizer::AbstractPLEOptimizer=default_multistart_bobyqa_config(),
     threshold::Union{Real,Nothing}=nothing,
-    # Backward-compatible keywords (pre-ProfileOptions API)
+    delta::Union{Real,Nothing}=nothing,
     method::Union{Symbol,Nothing}=nothing,
     n_points::Union{Int,Nothing}=nothing
 )
-    best_params = prob.best_params
-    isempty(best_params) && error("ODEChangepointPLEProblem.best_params must be set")
+    isempty(prob.best_params) && error("ODEChangepointPLEProblem.best_params must be set")
+    1 <= idx <= length(prob.best_params) || error("parameter index $idx out of range")
+    opt = _maybe_polish(optimizer, options)
 
-    # Step 0: Verify the reference loss.
-    verified_loss = evaluate_loss(prob, best_params)
-    best_loss = if isfinite(prob.best_loss)
-        if abs(verified_loss - prob.best_loss) > 0.01 * max(1.0, abs(prob.best_loss))
-            @warn "Reference loss mismatch: prob.best_loss=$(prob.best_loss), evaluated=$(verified_loss). Using evaluated value."
-        end
-        min(prob.best_loss, verified_loss)
-    else
-        verified_loss
+    verified = _verified_reference_loss(prob)
+    margin = _margin(threshold, delta, verified)
+    cur = _with_reference(prob, prob.best_params, verified)
+    if options.refit_reference
+        cur = refit_reference(cur; optimizer=opt)
     end
 
-    best_val = best_params[idx]
-    user_threshold = threshold !== nothing ? Float64(threshold) : best_loss + CHISQ_95
-
-    n = length(best_params)
-    free = setdiff(1:n, idx)
-    lb = prob.lb[free]
-    ub = prob.ub[free]
-
-    # Optional polishing: wrap non-hybrid optimizers in a two-stage hybrid.
-    opt = options.polish && !(optimizer isa HybridOptimizerConfig) ?
-          HybridOptimizerConfig(global_optimizer=optimizer) : optimizer
-
-    if method === :fixed
-        np = n_points !== nothing ? n_points : 20
-        result = _profile_fixed(prob, idx, best_params, best_loss, user_threshold,
-                                free, lb, ub, np, opt)
-    else
-        if method !== nothing && method !== :adaptive
-            @warn "Unknown profile method '$method'; using adaptive D2D stepping."
-        end
-        if n_points !== nothing
-            @warn "n_points is ignored for adaptive profiling; use ProfileOptions(samplesize=...) instead."
-        end
-        result = _profile_adaptive_d2d(prob, idx, best_params, best_loss,
-                                       user_threshold, free, lb, ub, options, opt)
+    if method !== nothing && method !== :adaptive && method !== :fixed
+        @warn "Unknown profile method '$method'; using adaptive D2D stepping."
     end
 
-    if options.allow_better_optimum
-        _profile_update_reference!(result, prob)
+    result = nothing
+    for update in 0:options.max_reference_updates
+        result = if method === :fixed
+            _profile_fixed(cur, idx, margin, n_points === nothing ? 20 : n_points, opt)
+        else
+            first(_profile_engine(cur, idx, cur.best_params, cur.changepoints,
+                                  cur.best_loss, margin,
+                                  _conditional_inner(cur, idx, opt), options;
+                                  samplesize=n_points === nothing ? options.samplesize : n_points))
+        end
+        if options.allow_better_optimum && update < options.max_reference_updates &&
+           result.best_found_loss < cur.best_loss - options.better_optimum_tol
+            @warn "Parameter $(prob.param_names[idx]): profile found loss $(result.best_found_loss) < reference $(cur.best_loss); restarting from the better optimum."
+            cur = refit_reference(_with_reference(cur, result.best_found_params,
+                                                  result.best_found_loss); optimizer=opt)
+            continue
+        end
+        break
     end
-
+    if result.best_found_loss < result.best_loss - options.better_optimum_tol
+        @warn "Parameter $(prob.param_names[idx]): profile still finds loss $(result.best_found_loss) below the reference $(result.best_loss); the interval is not reliable."
+    end
     return result
 end
 
 """
-    _profile_adaptive_d2d(prob, idx, best_params, best_loss, threshold, free, lb, ub, options, optimizer)
+    profile_all_parameters(prob; options=ProfileOptions(),
+                           optimizer=default_multistart_bobyqa_config(),
+                           indices=nothing, threshold=nothing, delta=nothing)
 
-D2D-style adaptive profiling (Raue et al. 2009, `PLE/ple.m`):
-1. Start at `θ*_i`.
-2. For each direction (lower/upper) choose an adaptive step so that the trial loss
-   increase is about `options.rel_step_increase * threshold_margin`.
-3. Re-optimise all free parameters at the accepted trial point.
-4. Record the optimised loss and update the warm-start for the next step.
-5. Stop when `loss - best_loss > options.stop_margin_factor * threshold_margin` or
-   the profile parameter hits a bound.
-6. Sort, smooth local jumps, and extract CIs by linear interpolation.
-"""
-function _profile_adaptive_d2d(prob, idx, best_params, best_loss, threshold,
-                               free, lb, ub, options, optimizer)
-    best_val = best_params[idx]
-    lower_bound = prob.lb[idx]
-    upper_bound = prob.ub[idx]
-    range_width = upper_bound - lower_bound
-    threshold_margin = threshold - best_loss
-    if threshold_margin <= 0
-        threshold_margin = max(1e-6 * max(1.0, abs(best_loss)), 1e-12)
-        @warn "Non-positive threshold margin for parameter $idx; using floor $threshold_margin. The profile will likely be very narrow."
-    end
-
-    min_step = max(range_width * options.min_step_factor, 1e-12)
-    max_step = range_width * options.max_step_factor
-
-    # Initial step: ~2% of parameter range or ~5% of parameter value, like D2D.
-    step0 = if best_val > 0
-        min(range_width / 50.0, best_val * 0.05)
-    else
-        range_width / 50.0
-    end
-    step0 = clamp(step0, min_step, max_step)
-
-    values = Float64[best_val]
-    losses = Float64[best_loss]
-    params_trace = Vector{Float64}[copy(best_params)]  # warm-start trajectory for smoothing
-    n_failed = 0
-    best_found = best_loss
-
-    # Lower direction
-    l_failed, l_best = _ple_profile_direction!(
-        prob, idx, best_params, best_loss, threshold, threshold_margin,
-        lower_bound, upper_bound, free, lb, ub, -1.0, step0, min_step, max_step,
-        options, optimizer, values, losses, params_trace
-    )
-    n_failed += l_failed
-    best_found = min(best_found, l_best)
-
-    # Upper direction
-    u_failed, u_best = _ple_profile_direction!(
-        prob, idx, best_params, best_loss, threshold, threshold_margin,
-        lower_bound, upper_bound, free, lb, ub, +1.0, step0, min_step, max_step,
-        options, optimizer, values, losses, params_trace
-    )
-    n_failed += u_failed
-    best_found = min(best_found, u_best)
-
-    # Sort by parameter value
-    perm = sortperm(values)
-    values = values[perm]
-    losses = losses[perm]
-    params_trace = params_trace[perm]
-
-    # D2D pleSmooth: remove local jumps by re-optimising from neighbours.
-    if options.smooth_jumps && length(values) >= 3
-        _profile_smooth_jumps!(
-            prob, idx, best_params, best_loss, threshold_margin, free, lb, ub,
-            options, optimizer, values, losses, params_trace
-        )
-        perm = sortperm(values)
-        values = values[perm]
-        losses = losses[perm]
-        params_trace = params_trace[perm]
-    end
-
-    if best_found < best_loss - 0.1
-        @warn "Parameter $(prob.param_names[idx]): profiling found loss $best_found < reference $best_loss. The reference optimum may not be the true MLE."
-    end
-
-    ci_lower, ci_upper, identifiable = ple_ci_interpolated(
-        values, losses, best_val, best_loss,
-        lower_bound, upper_bound, threshold
-    )
-
-    # Full parameter vector at the minimum loss encountered during profiling.
-    _, imin = findmin(losses)
-    best_found_params = params_trace[imin]
-
-    label = prob.param_names[idx]
-    return ProfileResult(
-        label, idx, best_val, best_loss, ci_lower, ci_upper, identifiable, threshold,
-        values, losses, n_failed, best_found, best_found_params
-    )
-end
-
-"""
-    _ple_profile_direction!(prob, idx, best_params, best_loss, threshold, threshold_margin,
-                            lower_bound, upper_bound, free, lb, ub, direction, step0,
-                            min_step, max_step, options, optimizer, values, losses, params_trace)
-
-Profile in one direction (`direction = -1` lower, `+1` upper).  Appends accepted
-points to `values`, `losses`, and `params_trace`.  Returns `(n_failed, best_found)`.
-"""
-function _ple_profile_direction!(
-    prob, idx, best_params, best_loss, threshold, threshold_margin,
-    lower_bound, upper_bound, free, lb, ub, direction::Float64, step0::Float64,
-    min_step::Float64, max_step::Float64, options::ProfileOptions,
-    optimizer::AbstractPLEOptimizer,
-    values::Vector{Float64}, losses::Vector{Float64},
-    params_trace::Vector{Vector{Float64}}
+Conditional profiles of every parameter (or of `indices`). All profiles share
+one reference fit: the reference is re-fitted once (`options.refit_reference`)
+and, if any profile finds a better optimum, the reference is replaced and *all*
+profiles are recomputed (`options.allow_better_optimum`). Parameters are
+profiled in parallel with `Threads.@threads` unless the optimiser is itself
+threaded. Returns a `Vector{ProfileResult}` ordered by parameter index."""
+function profile_all_parameters(
+    prob::ODEChangepointPLEProblem;
+    options::ProfileOptions=ProfileOptions(),
+    optimizer::AbstractPLEOptimizer=default_multistart_bobyqa_config(),
+    indices::Union{Nothing,Vector{Int}}=nothing,
+    threshold::Union{Real,Vector{Float64},Nothing}=nothing,
+    delta::Union{Real,Vector{Float64},Nothing}=nothing,
+    method::Union{Symbol,Nothing}=nothing,
+    n_points::Union{Int,Nothing}=nothing
 )
-    step = step0
-    current_val = best_params[idx]
-    x_warm = copy(best_params)
-    n_failed = 0
-    best_found = best_loss
-    points_this_dir = 0
+    idxs = indices === nothing ? collect(1:length(prob.best_params)) : indices
+    opt = _maybe_polish(optimizer, options)
+    verified = _verified_reference_loss(prob)
+    margins = [_margin(threshold isa Vector ? threshold[k] : threshold,
+                       delta isa Vector ? delta[k] : delta, verified)
+               for k in eachindex(idxs)]
 
-    while points_this_dir < options.samplesize
-        step = clamp(step, min_step, max_step)
-        candidate = current_val + direction * step
+    cur = _with_reference(prob, prob.best_params, verified)
+    options.refit_reference && (cur = refit_reference(cur; optimizer=opt))
+    inner_options = _with_options(options; refit_reference=false,
+                                  allow_better_optimum=false, polish=false)
 
-        # Clamp to bounds and make sure we make progress.
-        if direction < 0
-            candidate = max(candidate, lower_bound)
+    profiles = Vector{ProfileResult}(undef, length(idxs))
+    for update in 0:options.max_reference_updates
+        local run_one = k -> profile_parameter(cur, idxs[k]; options=inner_options,
+                                         optimizer=opt, delta=margins[k],
+                                         method=method, n_points=n_points)
+        if uses_internal_threads(opt)
+            for k in eachindex(idxs)
+                profiles[k] = run_one(k)
+            end
         else
-            candidate = min(candidate, upper_bound)
+            Base.Threads.@threads for k in eachindex(idxs)
+                profiles[k] = run_one(k)
+            end
         end
-
-        if (direction < 0 && candidate >= current_val) || (direction > 0 && candidate <= current_val)
-            break
+        best_found, kbest = findmin([p.best_found_loss for p in profiles])
+        if options.allow_better_optimum && update < options.max_reference_updates &&
+           best_found < cur.best_loss - options.better_optimum_tol
+            @warn "Profile of $(profiles[kbest].parameter) found loss $best_found < reference $(cur.best_loss); re-profiling all parameters from the better optimum."
+            cur = refit_reference(_with_reference(cur, profiles[kbest].best_found_params,
+                                                  best_found); optimizer=opt)
+            continue
         end
-
-        # D2D-style trial step: fix idx, evaluate loss at warm-start without
-        # re-optimising.  Reduce step until initial Δloss is acceptable.
-        trial_step_ok, used_step = _ple_trial_step(
-            prob, idx, candidate, x_warm, free, lb, ub, best_loss, threshold_margin,
-            step, direction, min_step, max_step, options
-        )
-
-        if !trial_step_ok
-            # Cannot find an acceptable step above min_step.
-            break
-        end
-        candidate = current_val + direction * used_step
-        if direction < 0
-            candidate = max(candidate, lower_bound)
-        else
-            candidate = min(candidate, upper_bound)
-        end
-
-        # Now re-optimise all free parameters with idx fixed to candidate.
-        loss_free = _build_loss_free(prob, idx, candidate, free)
-        x_init = x_warm[free]
-        loss, x_opt = try
-            optimize_ple(loss_free, x_init, lb, ub, optimizer)
-        catch e
-            @warn "Optimization failed for parameter $idx at value $candidate: $e"
-            Inf, x_init
-        end
-
-        push!(values, candidate)
-        push!(losses, loss)
-
-        if !isfinite(loss)
-            n_failed += 1
-            break
-        end
-
-        # Update warm-start for the next step.
-        x_warm[free] .= x_opt
-        x_warm[idx] = candidate
-        push!(params_trace, copy(x_warm))
-
-        if loss < best_found
-            best_found = loss
-        end
-
-        Δ = loss - best_loss
-        if Δ > options.stop_margin_factor * threshold_margin
-            break
-        end
-        if (direction < 0 && candidate <= lower_bound) || (direction > 0 && candidate >= upper_bound)
-            break
-        end
-
-        # Adapt step size for next iteration based on *optimised* Δloss.
-        if Δ < options.rel_step_increase * threshold_margin
-            step = used_step * options.step_factor
-        elseif Δ > 0.8 * threshold_margin
-            step = used_step / options.step_factor
-        else
-            step = used_step
-        end
-
-        current_val = candidate
-        points_this_dir += 1
+        break
     end
-
-    return n_failed, best_found
+    sort!(profiles, by=p -> p.index)
+    return profiles
 end
 
 """
-    _ple_trial_step(prob, idx, candidate, x_warm, free, lb, ub, best_loss,
-                    threshold_margin, step, direction, min_step, max_step, options)
+    _profile_fixed(prob, idx, margin, n_points, optimizer)
 
-D2D-style trial-step selection.  Fix `idx` to `candidate`, evaluate the loss at the
-warm-start `x_warm[free]` *without* re-optimising, and reduce `step` until the initial
-Δloss is below `rel_step_increase * threshold_margin`.  Returns `(ok, used_step)`.
-"""
-function _ple_trial_step(
-    prob, idx, candidate, x_warm, free, lb, ub, best_loss, threshold_margin,
-    step::Float64, direction::Float64, min_step::Float64, max_step::Float64,
-    options::ProfileOptions
-)
-    loss_free = _build_loss_free(prob, idx, candidate, free)
-    current_loss = loss_free(x_warm[free])
-    target = options.rel_step_increase * max(threshold_margin, 1e-12)
-
-    used_step = step
-    for _ in 1:options.max_trial_redos
-        # Recompute candidate from current_val = x_warm[idx]
-        cand = x_warm[idx] + direction * used_step
-        if direction < 0
-            cand = max(cand, prob.lb[idx])
-        else
-            cand = min(cand, prob.ub[idx])
-        end
-
-        # Build trial full vector
-        θ_trial = copy(x_warm)
-        θ_trial[idx] = cand
-        lf = _build_loss_free(prob, idx, cand, free)
-        trial_loss = lf(θ_trial[free])
-
-        if isfinite(trial_loss) && (trial_loss - current_loss) <= target
-            return true, used_step
-        end
-
-        used_step /= options.step_factor
-        if used_step < min_step
-            return false, used_step
-        end
-    end
-    return false, used_step
-end
-
-"""
-    _build_loss_free(prob, idx, fixed_val, free)
-
-Build a loss function over the free parameters with parameter `idx` fixed to
-`fixed_val`.  Returns `f(x_free) -> loss`.
-"""
-function _build_loss_free(prob, idx, fixed_val, free)
-    n = length(prob.best_params)
-    function loss_free(x_free)
-        θ = Vector{Float64}(undef, n)
-        θ[idx] = fixed_val
-        k = 1
-        for j in 1:n
-            if j == idx
-                continue
-            end
-            θ[j] = x_free[k]
-            k += 1
-        end
-        return evaluate_loss(prob, θ)
-    end
-    return loss_free
-end
-
-"""
-    _profile_smooth_jumps!(prob, idx, best_params, best_loss, threshold_margin,
-                           free, lb, ub, options, optimizer, values, losses, params_trace)
-
-D2D `pleSmooth` equivalent.  Detect local downward jumps in the profile and
-re-optimise from the neighbouring point to see whether the jump is a real
-feature or an optimization artifact.  Updates `values`, `losses`, and
-`params_trace` in place.
-"""
-function _profile_smooth_jumps!(
-    prob, idx, best_params, best_loss, threshold_margin, free, lb, ub,
-    options::ProfileOptions, optimizer::AbstractPLEOptimizer,
-    values::Vector{Float64}, losses::Vector{Float64}, params_trace::Vector{Vector{Float64}}
-)
-    n = length(values)
-    n == 0 && return
-    _, globminindex = findmin(losses)
-
-    candidates = Int[]
-    directions = Int[]
-
-    # Lower side of the minimum
-    if globminindex != n
-        for j in globminindex:-1:2
-            crumin = losses[j]
-            minchi2, minindex = findmin(losses[1:j])
-            if minindex == j - 1 && 1 <= minindex <= n && isfinite(minchi2) && (crumin - minchi2) > options.jump_tol
-                push!(candidates, minindex)
-                push!(directions, -1)
-            end
-        end
-        # Biggest diff
-        d = diff(losses[1:globminindex])
-        if length(d) > 2
-            dsort = sort(d, rev=true)
-            _, inddmax = findmax(d)
-            # Candidate is the left point of the largest diff (index in losses)
-            cand = inddmax
-            if dsort[1] > dsort[2] + 5 * (dsort[2] - dsort[3]) && 1 <= cand <= n
-                push!(candidates, cand)
-                push!(directions, -1)
-            end
-        end
-    end
-
-    # Upper side of the minimum
-    if globminindex != 1
-        for j in globminindex:(n - 1)
-            crumin = losses[j]
-            minchi2, minindex = findmin(losses[j:n])
-            cand = minindex + j - 1
-            if cand != j && 1 <= cand <= n && isfinite(minchi2) && (crumin - minchi2) > options.jump_tol
-                push!(candidates, cand)
-                push!(directions, +1)
-            end
-        end
-        d = diff(losses[n:-1:globminindex])
-        if length(d) > 2
-            dsort = sort(d, rev=true)
-            _, inddmax = findmax(d)
-            cand = n - inddmax + 1
-            if dsort[1] > dsort[2] + 5 * (dsort[2] - dsort[3]) && 1 <= cand <= n
-                push!(candidates, cand)
-                push!(directions, +1)
-            end
-        end
-    end
-
-    for (ci, dr) in zip(candidates, directions)
-        (ci < 1 || ci > n) && continue
-        p0 = copy(params_trace[ci])
-        while true
-            ni = ci + dr
-            (ni < 1 || ni > n) && break
-            target_val = values[ni]
-            p0[idx] = target_val
-            loss_free = _build_loss_free(prob, idx, target_val, free)
-            try
-                loss, x_opt = optimize_ple(loss_free, p0[free], lb, ub, optimizer)
-                θ = copy(p0)
-                θ[free] .= x_opt
-                if loss < losses[ni]
-                    losses[ni] = loss
-                    params_trace[ni] = θ
-                else
-                    break
-                end
-                p0 = θ
-                ci = ni
-            catch e
-                break
-            end
-        end
-    end
-end
-
-"""
-    _profile_update_reference!(result, prob)
-
-If profiling found a better optimum than the reference, log a warning with the
-parameter values at the improved minimum.  The problem struct is immutable, so
-the caller must create a new `ODEChangepointPLEProblem` with the improved
-reference if they wish to re-profile using it.
-"""
-function _profile_update_reference!(result::ProfileResult, prob::ODEChangepointPLEProblem)
-    if result.best_found_loss < result.best_loss - 1e-3
-        _, imin = findmin(result.losses)
-        @info "Profiling found a better optimum for parameter $(result.parameter): $(result.best_loss) -> $(result.best_found_loss). Consider rebuilding the problem with the improved reference before profiling other parameters."
-    end
-end
-
-# _profile_fixed and ple_ci_interpolated (kept largely unchanged)
-
-"""
-    _profile_fixed(prob, idx, best_params, best_loss, threshold, free, lb, ub, n_points, optimizer)
-
-Fixed-grid profiling (fallback).  Used when `method=:fixed` is requested.
-"""
-function _profile_fixed(prob, idx, best_params, best_loss, threshold, free, lb, ub, n_points, optimizer)
-    best_val = best_params[idx]
+Fixed-grid profiling (fallback used when `method=:fixed`)."""
+function _profile_fixed(prob, idx, margin, n_points, optimizer)
+    best_val = prob.best_params[idx]
+    ref_loss = prob.best_loss
+    threshold = ref_loss + margin
     grid = _fixed_grid(prob.lb[idx], prob.ub[idx], best_val, n_points)
+    inner = _conditional_inner(prob, idx, optimizer)
 
-    x0 = copy(best_params)
-    values = Float64[]
-    losses = Float64[]
-    params_trace = Vector{Float64}[]
+    tr = _ProfileTrace()
     n_failed = 0
-    best_found = best_loss
-
-    for v in grid
-        loss_free = _build_loss_free(prob, idx, v, free)
-        x_init = x0[free]
-        loss, x_opt = try
-            optimize_ple(loss_free, x_init, lb, ub, optimizer)
-        catch e
-            @warn "Optimization failed for parameter $idx at value $v: $e"
-            Inf, x_init
-        end
-
-        if isfinite(loss)
-            x0[free] .= x_opt
-            if loss < best_found
-                best_found = loss
+    # sweep outward from the reference in both directions for good warm starts
+    below = reverse(filter(<(best_val), grid))
+    above = filter(>(best_val), grid)
+    _trace_push!(tr, best_val, ref_loss, prob.best_params, prob.changepoints)
+    for side in (below, above)
+        warm = copy(prob.best_params)
+        for v in side
+            loss, θ, cps = inner(v, _with_value(warm, idx, v), prob.changepoints)
+            if isfinite(loss)
+                warm = θ
+            else
+                n_failed += 1
             end
-        else
-            n_failed += 1
+            _trace_push!(tr, v, loss, θ, cps)
         end
-
-        push!(values, v)
-        push!(losses, loss)
-        push!(params_trace, copy(x0))
     end
-
+    _trace_sort!(tr)
     ci_lower, ci_upper, identifiable = ple_ci_interpolated(
-        values, losses, best_val, best_loss,
-        prob.lb[idx], prob.ub[idx], threshold
-    )
-
-    _, imin = findmin(losses)
-    best_found_params = params_trace[imin]
-
-    label = prob.param_names[idx]
+        tr.values, tr.losses, best_val, ref_loss, prob.lb[idx], prob.ub[idx], threshold)
+    best_found, imin = findmin(tr.losses)
     return ProfileResult(
-        label, idx, best_val, best_loss, ci_lower, ci_upper, identifiable, threshold,
-        values, losses, n_failed, best_found, best_found_params
-    )
+        prob.param_names[idx], idx, best_val, ref_loss, ci_lower, ci_upper,
+        identifiable, threshold, tr.values, tr.losses, n_failed, best_found,
+        tr.params[imin], tr.cps)
 end
 
 function _fixed_grid(lower, upper, best_val, n_points)
@@ -624,6 +682,42 @@ function ple_ci_interpolated(
     return (ci_lower, ci_upper, identifiable)
 end
 
+"""
+    profile_confidence_intervals(p::ProfileResult)
+
+All maximal intervals of the profile curve that lie below `p.threshold`
+(endpoints by linear interpolation; an interval touching the first/last
+profile point is open-ended at that point). The profile CI reported in
+`p.ci_lower`/`p.ci_upper` is the component containing the estimate; additional
+components indicate a disconnected (multimodal) confidence region."""
+function profile_confidence_intervals(p::ProfileResult)
+    perm = sortperm(p.values)
+    v = p.values[perm]
+    l = p.losses[perm]
+    thr = p.threshold
+    out = Tuple{Float64,Float64}[]
+    n = length(v)
+    inside = isfinite.(l) .& (l .<= thr)
+    i = 1
+    while i <= n
+        if inside[i]
+            j = i
+            while j < n && inside[j + 1]
+                j += 1
+            end
+            lo = i > 1 && isfinite(l[i - 1]) ?
+                 v[i] - (thr - l[i]) / (l[i - 1] - l[i]) * (v[i] - v[i - 1]) : v[i]
+            hi = j < n && isfinite(l[j + 1]) ?
+                 v[j] + (thr - l[j]) / (l[j + 1] - l[j]) * (v[j + 1] - v[j]) : v[j]
+            push!(out, (lo, hi))
+            i = j + 1
+        else
+            i += 1
+        end
+    end
+    return out
+end
+
 # Old discrete CI kept for backward compatibility.
 """
     ple_ci(values, losses, best_val, best_loss, lower_bound, upper_bound, threshold)
@@ -666,56 +760,6 @@ function ple_ci(
     ci_upper = svals[right]
     identifiable = (ci_lower > lower_bound) && (ci_upper < upper_bound)
     return (ci_lower, ci_upper, identifiable)
-end
-
-"""
-    profile_all_parameters(prob::ODEChangepointPLEProblem;
-                           options=ProfileOptions(),
-                           optimizer=default_multistart_bobyqa_config(),
-                           indices=nothing)
-
-Profile every parameter (or a subset specified by `indices`) in `prob.best_params`
-in parallel using `Base.Threads.@threads`.  Returns a `Vector{ProfileResult}`
-ordered by parameter index.
-"""
-function profile_all_parameters(
-    prob::ODEChangepointPLEProblem;
-    options::ProfileOptions=ProfileOptions(),
-    optimizer::AbstractPLEOptimizer=default_multistart_bobyqa_config(),
-    indices::Union{Nothing,Vector{Int}}=nothing,
-    threshold::Union{Real,Vector{Float64},Nothing}=nothing,
-    method::Union{Symbol,Nothing}=nothing,
-    n_points::Union{Int,Nothing}=nothing
-)
-    idxs = indices === nothing ? collect(1:length(prob.best_params)) : indices
-    profiles = Vector{ProfileResult}(undef, length(idxs))
-    # If the inner optimizer already uses threads, run parameters serially so each
-    # parameter profile can fully utilise the available cores without oversubscription.
-    if uses_internal_threads(optimizer)
-        for k in 1:length(idxs)
-            i = idxs[k]
-            thr = threshold isa Vector{Float64} ? threshold[k] : threshold
-            profiles[k] = profile_parameter(prob, i;
-                                          options=options,
-                                          optimizer=optimizer,
-                                          threshold=thr,
-                                          method=method,
-                                          n_points=n_points)
-        end
-    else
-        Base.Threads.@threads for k in 1:length(idxs)
-            i = idxs[k]
-            thr = threshold isa Vector{Float64} ? threshold[k] : threshold
-            profiles[k] = profile_parameter(prob, i;
-                                          options=options,
-                                          optimizer=optimizer,
-                                          threshold=thr,
-                                          method=method,
-                                          n_points=n_points)
-        end
-    end
-    sort!(profiles, by=p -> p.index)
-    return profiles
 end
 
 """

@@ -1,578 +1,473 @@
-"""    evaluate_loss(prob::ODEChangepointPLEProblem, params, cps)
-
-Evaluate the loss for `params` and a *custom* changepoint vector `cps`.  Uses the
-same priority as the single-argument version: objective > simulator > generic ODE
-solver."""
-function evaluate_loss(prob::ODEChangepointPLEProblem, params::Vector{Float64}, cps::Vector{Int})
-    if prob.objective !== nothing
-        return prob.objective(params, cps)
-    elseif prob.simulator !== nothing
-        sim = prob.simulator(params, cps)
-        return prob.loss_fn(sim, prob.data)
-    elseif prob.ode_function !== nothing
-        sim = solve_segments(prob, params, cps)
-        if any(isnan, sim)
-            return Inf
-        end
-        return prob.loss_fn(sim, prob.data)
-    else
-        error("ODEChangepointPLEProblem has no objective, simulator, or ode_function")
-    end
-end
-
-function solve_segments(prob, params, cps::Vector{Int})
-    t0, tf = prob.tspan
-    cps_sorted = filter(cp -> t0 < cp < tf, sort(Float64.(cps)))
-
-    u0 = copy(prob.u0)
-    t_start = t0
-    parts = Matrix{Float64}[]
-
-    for cp in cps_sorted
-        sol = _solve_segment(prob, u0, (t_start, cp), params)
-        any(isnan, sol) && return fill(NaN, length(prob.u0), Int(ceil(tf - t0)) + 1)
-        if size(sol, 2) > 1
-            push!(parts, sol[:, 1:end-1])
-        end
-        u0 = sol[:, end]
-        t_start = cp
-    end
-
-    sol = _solve_segment(prob, u0, (t_start, tf), params)
-    any(isnan, sol) && return fill(NaN, length(prob.u0), Int(ceil(tf - t0)) + 1)
-    push!(parts, sol)
-
-    return reduce(hcat, parts)
-end
-
 """    _build_loss_free_cp(prob, idx, fixed_val, cps, free)
 
-Build a loss function that fixes parameter `idx` to `fixed_val` and uses the
-changepoint vector `cps`.  The free parameters are the same order as `free`."""
-function _build_loss_free_cp(prob, idx, fixed_val, cps, free)
-    n = length(prob.best_params)
-    function loss_free(x_free)
-        θ = Vector{Float64}(undef, n)
-        θ[idx] = fixed_val
-        k = 1
-        for j in 1:n
-            if j == idx
-                continue
-            end
-            θ[j] = x_free[k]
-            k += 1
-        end
-        return evaluate_loss(prob, θ, cps)
+Loss over the free parameters with parameter `idx` fixed to `fixed_val` at the
+changepoint vector `cps`."""
+_build_loss_free_cp(prob, idx, fixed_val, cps, free) =
+    _build_loss_free(prob, idx, fixed_val, free, cps)
+
+"""    CPSearchSpace(center, window, n_obs; step=1, min_seg=10)
+
+Discrete changepoint search set used by the joint profile:
+
+    T = { τ : τ_j - center_j ∈ {-window, …, window} (multiples of `step`),
+          min_seg ≤ τ_j ≤ n_obs - min_seg,  τ_{j+1} - τ_j ≥ min_seg }.
+
+The set is centred on the *detected* changepoints and is the same for the joint
+reference fit and for every profile point, so the joint profile is a proper
+profile over a fixed nuisance space (never above the conditional profile,
+because the detected changepoints belong to `T`). Membership is tested with
+`in`; `enumerate_space` lists all elements (for exhaustive search)."""
+struct CPSearchSpace
+    center::Vector{Int}
+    window::Int
+    step::Int
+    min_seg::Int
+    n_obs::Int
+end
+CPSearchSpace(center, window, n_obs; step::Int=1, min_seg::Int=10) =
+    CPSearchSpace(collect(Int, center), window, max(1, step), min_seg, n_obs)
+
+function Base.in(c::AbstractVector{<:Integer}, S::CPSearchSpace)
+    length(c) == length(S.center) || return false
+    lo, hi = max(S.min_seg, 1), S.n_obs - S.min_seg
+    for j in eachindex(c)
+        d = c[j] - S.center[j]
+        (abs(d) <= S.window && d % S.step == 0 && lo <= c[j] <= hi) || return false
+        j > 1 && c[j] - c[j - 1] < S.min_seg && return false
     end
-    return loss_free
+    return true
 end
 
-"""    _joint_optimize_params(prob, fixed_idx, fixed_val, cps, x_init, optimizer)
-
-Optimise all parameters except `fixed_idx` for a *fixed* changepoint vector `cps`.
-Returns `(loss, params_full, success)`."""
-function _joint_optimize_params(prob, fixed_idx, fixed_val, cps, x_init, optimizer)
-    n = length(prob.best_params)
-    free = setdiff(1:n, fixed_idx)
-    lb = prob.lb[free]
-    ub = prob.ub[free]
-    loss_free = _build_loss_free_cp(prob, fixed_idx, fixed_val, cps, free)
-    try
-        loss, x_opt = optimize_ple(loss_free, x_init, lb, ub, optimizer)
-        θ = Vector{Float64}(undef, n)
-        θ[fixed_idx] = fixed_val
-        k = 1
-        for j in 1:n
-            if j == fixed_idx
-                continue
-            end
-            θ[j] = x_opt[k]
-            k += 1
-        end
-        return loss, θ, isfinite(loss)
-    catch e
-        @warn "Joint param optimization failed for cps=$cps: $e"
-        return Inf, copy(prob.best_params), false
-    end
+"""Number of changepoint vectors in the box (before separation constraints)."""
+function _space_box_size(S::CPSearchSpace)
+    isempty(S.center) && return 1
+    lo, hi = max(S.min_seg, 1), S.n_obs - S.min_seg
+    return prod(count(d -> lo <= c + d <= hi, (-S.window):S.step:S.window) for c in S.center)
 end
 
-"""    _joint_cp_grid(cps0, window, n_obs)
-
-Generate a discrete search grid around the initial changepoints `cps0`.  Each CP is
-varied by `±window` days, subject to a minimum segment length of `min_seg` and the
-data boundary `[min_seg, n_obs - min_seg]`.  Returns a vector of valid CP vectors.
-
-For a small number of CPs (≤3) this exhaustive grid is feasible; for more CPs it
-would explode, so the function raises an error when the grid would exceed
-`max_combinations` (default 5000)."""
-function _joint_cp_grid(cps0::Vector{Int}, window::Int, n_obs::Int; step::Int=1, min_seg::Int=10, max_combinations::Int=5000)
-    isempty(cps0) && return [Int[]]
-    step = max(1, step)
-    lower_t = max(min_seg, 1)
-    upper_t = max(lower_t, n_obs - min_seg)
-
-    ranges = Vector{Int}[]
-    for cp in cps0
-        r = Int[]
-        for δ in (-window):step:window
-            cand = cp + δ
-            if cand < lower_t || cand > upper_t
-                continue
-            end
-            push!(r, cand)
-        end
-        push!(ranges, sort(unique(r)))
-    end
-
-    # Cartesian product of all CP ranges
-    combs = Iterators.product(ranges...)
+function enumerate_space(S::CPSearchSpace; max_combinations::Int=5000)
+    isempty(S.center) && return [Int[]]
+    n_comb = _space_box_size(S)
+    n_comb > max_combinations &&
+        error("CP grid too large ($n_comb > $max_combinations); reduce window, increase step, or use cp_search=:local")
+    lo, hi = max(S.min_seg, 1), S.n_obs - S.min_seg
+    ranges = [[c + d for d in (-S.window):S.step:S.window if lo <= c + d <= hi] for c in S.center]
     grid = Vector{Int}[]
-    for c in combs
-        cps = sort(collect(Int, c))
-        # Require minimum separation and no collisions
-        if all(cps[i+1] - cps[i] >= min_seg for i in 1:(length(cps)-1))
-            push!(grid, cps)
-        end
+    for c in Iterators.product(ranges...)
+        v = collect(Int, c)
+        v in S && push!(grid, v)
     end
-
-    length(grid) > max_combinations && error("CP grid too large ($(length(grid)) > $max_combinations); reduce window or number of CPs")
+    sort!(grid)
     return grid
 end
 
-"""    _joint_optimize_cp_grid(prob, fixed_idx, fixed_val, cps0, window, params0, optimizer)
+"""    _joint_cp_grid(cps0, window, n_obs; step=1, min_seg=10, max_combinations=5000)
 
-Exhaustively search a discrete grid of CP locations around `cps0` (±`window`),
-optimising the free parameters for each CP set, and return the best overall
-`(loss, params_full, cps)`.  This is the inner joint-optimization step used when
-profiling a parameter while treating changepoint locations as nuisance variables."""
-function _joint_optimize_cp_grid(prob, fixed_idx, fixed_val, cps0, window, params0, optimizer; step::Int=1, parallelize_grid::Bool=true)
-    grid = _joint_cp_grid(cps0, window, prob.n_obs; step=step)
+All changepoint vectors of `CPSearchSpace(cps0, window, n_obs; step, min_seg)`."""
+_joint_cp_grid(cps0::Vector{Int}, window::Int, n_obs::Int; step::Int=1, min_seg::Int=10,
+               max_combinations::Int=5000) =
+    enumerate_space(CPSearchSpace(cps0, window, n_obs; step=step, min_seg=min_seg);
+                    max_combinations=max_combinations)
 
-    free = setdiff(1:length(params0), fixed_idx)
-    x_init = params0[free]
-
-    # NOTE: every grid point is optimised starting from the *reference* free
-    # parameters (x_init).  Warm-starting one grid point from the previous grid
-    # point's result poisons the whole sweep: a bad CP set early in the grid
-    # pulls the optimizer into a bad basin and all subsequent CP sets inherit
-    # that starting point, so even the true CP set returns a garbage loss.
-    if parallelize_grid && !uses_internal_threads(optimizer) && length(grid) > 1
-        n_grid = length(grid)
-        losses = Vector{Float64}(undef, n_grid)
-        params_list = Vector{Vector{Float64}}(undef, n_grid)
-        cps_list = Vector{Vector{Int}}(undef, n_grid)
-        oks = Vector{Bool}(undef, n_grid)
-
-        Base.Threads.@threads for i in 1:n_grid
-            cps = grid[i]
-            loss, θ, ok = _joint_optimize_params(prob, fixed_idx, fixed_val, cps, x_init, optimizer)
-            losses[i] = ok ? loss : Inf
-            params_list[i] = θ
-            cps_list[i] = cps
-            oks[i] = ok
-        end
-
-        best_idx = argmin(losses)
-        best_loss = losses[best_idx]
-        best_params = params_list[best_idx]
-        best_cps = cps_list[best_idx]
-
-        # Polish: re-optimise the winning CP set from its own optimum, as in
-        # the serial branch, so grid-parallel results match serial ones.
-        if isfinite(best_loss)
-            loss2, θ2, ok2 = _joint_optimize_params(prob, fixed_idx, fixed_val, best_cps, best_params[free], optimizer)
-            if ok2 && loss2 < best_loss
-                best_loss = loss2
-                best_params = θ2
+"""Coordinate search over `space` from `start`: move one changepoint by ±step
+while `evalc(c, warm_params)` improves. Returns `(loss, params, cps, visited)`."""
+function _coordinate_cp_search(evalc, space::CPSearchSpace, start, warm)
+    best_c = collect(Int, start)
+    best_l, best_θ = evalc(best_c, warm)
+    while true
+        moved = false
+        for j in eachindex(best_c), s in (-space.step, space.step)
+            c = copy(best_c)
+            c[j] += s
+            c in space || continue
+            l, θ = evalc(c, best_θ)
+            if l < best_l - 1e-10
+                best_l, best_θ, best_c = l, θ, c
+                moved = true
             end
         end
-    else
-        best_loss = Inf
-        best_params = copy(params0)
-        best_cps = copy(cps0)
-
-        for cps in grid
-            loss, θ, ok = _joint_optimize_params(prob, fixed_idx, fixed_val, cps, x_init, optimizer)
-            if ok && loss < best_loss
-                best_loss = loss
-                best_params = θ
-                best_cps = cps
-            end
-        end
-
-        # Polish: re-optimise the best CP set starting from its own optimum to
-        # counteract Nelder-Mead stalling.
-        if isfinite(best_loss)
-            loss2, θ2, ok2 = _joint_optimize_params(prob, fixed_idx, fixed_val, best_cps, best_params[free], optimizer)
-            if ok2 && loss2 < best_loss
-                best_loss = loss2
-                best_params = θ2
-            end
-        end
+        moved || break
     end
-
-    return best_loss, best_params, best_cps
+    return best_l, best_θ, best_c
 end
 
-"""    joint_reference_fit(prob, window, optimizer; step=1, parallelize_grid=true)
+"""
+    _joint_inner(prob, idx, space, optimizer; parallel=false, cp_search=:grid, mode_starts)
 
-Jointly re-fit ALL parameters and the changepoint locations (on the discrete
-±`window` grid around `prob.changepoints`) to establish the joint maximum
-likelihood estimate.  Joint PLE profiles must be anchored at this joint MLE:
-the conditional best fit at fixed changepoints can sit far above the joint
-optimum, which makes any χ² threshold referenced to it meaningless.
+Inner solver of the joint profile: minimise over all free parameters *and* over
+changepoint vectors in the fixed search set `space`.
 
-`n_starts` controls the multi-start: each grid point is optimised from the
-reference point plus `n_starts - 1` random perturbations of it (±`perturbation`
-of the bound range).  A single Nelder-Mead start can stall far above the joint
-MLE on ridged likelihoods; a few extra starts make the anchor much more
-reliable at negligible cost relative to the profiling itself.  Additional
-deterministic starting points (e.g. an optimum found in an earlier run or
-mapped from a nested configuration) can be supplied via `extra_starts`; they
-are tried at every grid point.
+* `cp_search = :grid` – exhaustive search: every CP vector is optimised from the
+  warm start and the best is returned.
+* `cp_search = :local` – coordinate search starting from the warm CP vector:
+  move single changepoints by one step while the loss improves. Much cheaper
+  (needed for many changepoints) but can miss a distant better configuration."""
+function _joint_inner(prob, idx, space::CPSearchSpace, optimizer;
+                      parallel::Bool=false, cp_search::Symbol=:grid,
+                      mode_starts::Dict{Vector{Int},Vector{Float64}}=Dict{Vector{Int},Vector{Float64}}())
+    # optimise at one CP vector from the warm start and, for admissible modes,
+    # additionally from the mode's own optimum
+    fit_cps(value, cps, warm) = begin
+        local l1, θ1 = _optimize_fixed(prob, idx, value, cps, warm, optimizer)
+        if haskey(mode_starts, cps)
+            local l2, θ2 = _optimize_fixed(prob, idx, value, cps,
+                                           _with_value(mode_starts[cps], idx, value), optimizer)
+            l2 < l1 && return (l2, θ2)
+        end
+        (l1, θ1)
+    end
+    if cp_search === :grid
+        grid = enumerate_space(space)
+        return function (value, warm, warm_cps)
+            local ng = length(grid)
+            local losses, params, l, ibest
+            losses = fill(Inf, ng)
+            params = Vector{Vector{Float64}}(undef, ng)
+            if parallel && ng > 1
+                Base.Threads.@threads for i in 1:ng
+                    losses[i], params[i] = fit_cps(value, grid[i], warm)
+                end
+            else
+                for i in 1:ng
+                    losses[i], params[i] = fit_cps(value, grid[i], warm)
+                end
+            end
+            l, ibest = findmin(losses)
+            return l, params[ibest], copy(grid[ibest])
+        end
+    elseif cp_search === :local
+        return function (value, warm, warm_cps)
+            local start, cache
+            start = warm_cps in space ? collect(Int, warm_cps) : collect(Int, prob.changepoints)
+            cache = Dict{Vector{Int},Tuple{Float64,Vector{Float64}}}()
+            evalc = (c, w) -> get!(() -> fit_cps(value, c, w), cache, c)
+            l, θ, c = _coordinate_cp_search(evalc, space, start, warm)
+            # also start the search from the detected changepoints and from
+            # every admissible mode, so that the result does not depend on the
+            # path of the profile alone
+            for s0 in Iterators.flatten(([collect(Int, prob.changepoints)], keys(mode_starts)))
+                s0 == start && continue
+                l2, θ2, c2 = _coordinate_cp_search(evalc, space, s0,
+                                                   haskey(mode_starts, s0) ?
+                                                   _with_value(mode_starts[s0], idx, value) : warm)
+                if l2 < l
+                    l, θ, c = l2, θ2, c2
+                end
+            end
+            return l, θ, c
+        end
+    else
+        error("Unknown cp_search=$cp_search; use :grid or :local")
+    end
+end
+
+"""    joint_reference_fit(prob, window, optimizer; step=1, min_seg=10,
+                        parallelize_grid=true, n_starts=3, perturbation=0.3,
+                        extra_starts=Vector{Float64}[], seed=nothing)
+
+Jointly re-fit all parameters and the changepoint locations over the fixed CP
+set `T` (see `_joint_cp_grid`) to obtain the joint maximum-likelihood estimate.
+Each CP vector is optimised from `prob.best_params`, from `n_starts - 1` random
+perturbations of it (±`perturbation` of the bound range), and from every
+vector in `extra_starts`. The result is never worse than the loss at
+`(prob.best_params, prob.changepoints)`.
 
 Returns `(best_loss, best_params, best_cps)`."""
-function joint_reference_fit(prob::ODEChangepointPLEProblem, window::Int, optimizer::AbstractPLEOptimizer; step::Int=1, parallelize_grid::Bool=true, n_starts::Int=3, perturbation::Float64=0.3, extra_starts::Vector{Vector{Float64}}=Vector{Float64}[])
-    grid = _joint_cp_grid(prob.changepoints, window, prob.n_obs; step=step)
-    x0 = copy(prob.best_params)
-    lb = prob.lb
-    ub = prob.ub
+function joint_reference_fit(prob::ODEChangepointPLEProblem, window::Int,
+                             optimizer::AbstractPLEOptimizer; kwargs...)
+    g = joint_grid_fit(prob, window, optimizer; kwargs...)
+    return g.best_loss, g.best_params, g.best_cps
+end
 
+"""    joint_grid_fit(prob, window, optimizer; kwargs...)
+
+As `joint_reference_fit`, but returns a named tuple with the joint optimum
+(`best_loss`, `best_params`, `best_cps`) **and** the optimum at every changepoint
+vector of the search set (`grid`, `losses`, `params`). The per-grid optima are
+used by the joint profile to locate secondary modes of the confidence region."""
+function joint_grid_fit(prob::ODEChangepointPLEProblem, window::Int,
+                        optimizer::AbstractPLEOptimizer;
+                        step::Int=1, min_seg::Int=10,
+                        parallelize_grid::Bool=true, n_starts::Int=3,
+                        perturbation::Float64=0.3,
+                        extra_starts::Vector{Vector{Float64}}=Vector{Float64}[],
+                        seed::Union{Int,Nothing}=nothing,
+                        cp_search::Symbol=:grid)
+    space = CPSearchSpace(prob.changepoints, window, prob.n_obs; step=step, min_seg=min_seg)
+    x0 = clamp.(prob.best_params, prob.lb, prob.ub)
+    lb, ub = prob.lb, prob.ub
+    rng = seed === nothing ? Random.default_rng() : Random.MersenneTwister(seed)
+    starts = Vector{Vector{Float64}}([x0])
+    for _ in 2:n_starts
+        push!(starts, clamp.(x0 .+ perturbation .* (ub .- lb) .* (2.0 .* rand(rng, length(x0)) .- 1.0), lb, ub))
+    end
+    append!(starts, extra_starts)
+
+    # NOTE: all variables assigned inside this closure are declared `local`;
+    # otherwise Julia shares them with same-named variables of the enclosing
+    # function, which is a data race when grid points run on several threads.
     function fit_at(cps)
-        f = x -> evaluate_loss(prob, x, cps)
-        best_l = Inf
-        best_x = copy(x0)
-        starts = Vector{Vector{Float64}}(undef, n_starts + length(extra_starts))
-        starts[1] = x0
-        for s in 2:n_starts
-            starts[s] = clamp.(x0 .+ perturbation .* (ub .- lb) .* (2.0 .* rand(length(x0)) .- 1.0), lb, ub)
-        end
-        for (k, xs) in enumerate(extra_starts)
-            starts[n_starts + k] = xs
-        end
-        for (s, xs) in enumerate(starts)
-            try
-                loss, x_opt = optimize_ple(f, xs, lb, ub, optimizer)
-                if isfinite(loss) && loss < best_l
-                    best_l = loss
-                    best_x = x_opt
-                end
+        local f = x -> evaluate_loss(prob, x, cps)
+        local best_l, best_x = Inf, copy(x0)
+        local l0, l, x
+        for xs in starts
+            l0 = f(xs)
+            if l0 < best_l
+                best_l, best_x = l0, copy(xs)
+            end
+            l, x = try
+                optimize_ple(f, xs, lb, ub, optimizer)
             catch e
-                @warn "Joint reference fit failed for cps=$cps (start $s): $e"
+                @debug "Joint reference fit failed for cps=$cps" exception = e
+                (Inf, xs)
+            end
+            if isfinite(l) && l < best_l
+                best_l, best_x = l, collect(Float64, x)
             end
         end
-        return best_l, best_x, cps, isfinite(best_l)
+        return best_l, best_x
     end
 
-    best_loss = Inf
-    best_params = copy(x0)
-    best_cps = copy(prob.changepoints)
-
-    if parallelize_grid && !uses_internal_threads(optimizer) && length(grid) > 1
-        n_grid = length(grid)
-        losses = Vector{Float64}(undef, n_grid)
-        params_list = Vector{Vector{Float64}}(undef, n_grid)
-        cps_list = Vector{Vector{Int}}(undef, n_grid)
-        Base.Threads.@threads for i in 1:n_grid
-            loss, θ, cps, ok = fit_at(grid[i])
-            losses[i] = ok ? loss : Inf
-            params_list[i] = θ
-            cps_list[i] = cps
+    if cp_search === :local
+        # coordinate search from the detected changepoints; every visited CP
+        # vector is optimised from all starts (and from the current optimum)
+        visited = Dict{Vector{Int},Tuple{Float64,Vector{Float64}}}()
+        evalc = (c, w) -> get!(visited, c) do
+            local l, x, f, lw, l2, x2
+            l, x = fit_at(c)
+            f = θ -> evaluate_loss(prob, θ, c)
+            lw = f(w)
+            lw < l && ((l, x) = (lw, copy(w)))
+            l2, x2 = try
+                optimize_ple(f, w, lb, ub, optimizer)
+            catch
+                (Inf, w)
+            end
+            (isfinite(l2) && l2 < l) ? (Float64(l2), collect(Float64, x2)) : (l, x)
         end
-        best_idx = argmin(losses)
-        best_loss = losses[best_idx]
-        best_params = params_list[best_idx]
-        best_cps = cps_list[best_idx]
+        _coordinate_cp_search(evalc, space, collect(Int, prob.changepoints), x0)
+        grid = sort(collect(keys(visited)))
+        losses = [visited[c][1] for c in grid]
+        params = [visited[c][2] for c in grid]
     else
-        for cps in grid
-            loss, θ, cps_out, ok = fit_at(cps)
-            if ok && loss < best_loss
-                best_loss = loss
-                best_params = θ
-                best_cps = cps_out
-            end
+        grid = enumerate_space(space)
+        losses = fill(Inf, length(grid))
+        params = Vector{Vector{Float64}}(undef, length(grid))
+    end
+    ng = length(grid)
+    if cp_search === :local
+        # already evaluated
+    elseif parallelize_grid && !uses_internal_threads(optimizer) && ng > 1
+        Base.Threads.@threads for i in 1:ng
+            losses[i], params[i] = fit_at(grid[i])
+        end
+    else
+        for i in 1:ng
+            losses[i], params[i] = fit_at(grid[i])
         end
     end
+    best_loss, ibest = findmin(losses)
+    best_params, best_cps = params[ibest], copy(grid[ibest])
 
     # Polish the winner from its own optimum.
-    if isfinite(best_loss)
-        loss2, θ2, ok2 = try
-            f = x -> evaluate_loss(prob, x, best_cps)
-            l, x_opt = optimize_ple(f, best_params, lb, ub, optimizer)
-            (l, x_opt, isfinite(l))
-        catch e
-            (Inf, best_params, false)
-        end
-        if ok2 && loss2 < best_loss
-            best_loss = loss2
-            best_params = θ2
-        end
+    f_best = x -> evaluate_loss(prob, x, best_cps)
+    l2, x2 = try
+        optimize_ple(f_best, best_params, lb, ub, optimizer)
+    catch
+        (Inf, best_params)
+    end
+    if isfinite(l2) && l2 < best_loss
+        best_loss, best_params = l2, collect(Float64, x2)
     end
 
-    return best_loss, best_params, best_cps
+    # Never worse than the conditional fit, which is a member of the grid.
+    l_cond = evaluate_loss(prob, prob.best_params, prob.changepoints)
+    if l_cond < best_loss
+        @warn "Joint reference fit ($best_loss) is worse than the conditional fit ($l_cond); using the conditional fit. Increase n_starts or use a stronger optimizer."
+        best_loss, best_params, best_cps = l_cond, copy(prob.best_params), copy(prob.changepoints)
+    end
+    # keep the per-grid optima consistent with the (possibly polished) winner
+    iw = findfirst(==(best_cps), grid)
+    if iw !== nothing && best_loss < losses[iw]
+        losses[iw], params[iw] = best_loss, copy(best_params)
+    end
+    return (best_loss=best_loss, best_params=best_params, best_cps=best_cps,
+            grid=grid, losses=losses, params=params)
 end
 
 """    profile_parameter_joint(prob::ODEChangepointPLEProblem, idx;
-                            n_points=20, window=7, optimizer=default_de_config(),
-                            threshold=nothing)
+                            options=ProfileOptions(), window=7, step=1, min_seg=10,
+                            optimizer=default_multistart_bobyqa_config(),
+                            threshold=nothing, delta=nothing, joint_reference=nothing,
+                            cp_search=:grid, parallelize_grid=true, n_points=nothing)
 
-Adaptive profile-likelihood for parameter `idx` where changepoint locations are
-*treated as nuisance variables* and jointly optimised at each profile step.
+Joint profile likelihood of parameter `idx`: at every profile point the loss is
+minimised over all other parameters **and** over the changepoint locations in
+the fixed set `T` (all CP vectors within `±window` of the detected
+changepoints, spacing `step`, minimum segment length `min_seg`).
 
-Algorithm (D2D-style adaptive stepping + joint CP search):
-1. Start at the conditional best-fit `(best_params, changepoints)`.
-2. Step the profiled parameter `idx` outward in both directions.
-3. At each step, fix `idx` to the candidate value and jointly optimise:
-   (a) all other parameters, and
-   (b) all changepoint locations within `±window` of the current best CP set.
-   The joint optimum is found by an exhaustive CP grid search (feasible for the
-   BIC winner's 2 CPs) with a parameter re-optimisation for each CP set.
-4. Adapt the step size based on the joint optimised Δloss relative to the
-   threshold margin, as in `_profile_adaptive`.
-5. Stop when Δloss exceeds `2 × threshold_margin` or the parameter bound is hit.
+The profile is anchored at the joint MLE over `T` (`joint_reference`, computed
+with `joint_reference_fit` if not supplied) and the threshold is
+`joint_reference_loss + delta` (default `delta = 3.8415`). Every joint profile
+value is a minimum over a superset of the conditional problem, so the joint
+profile never lies above the conditional profile; because the joint reference
+can also be lower than the conditional one, joint intervals are usually, but
+not necessarily, wider than conditional intervals.
 
-Returns a `ProfileResult` whose `best_loss`, `ci_lower`, `ci_upper` and profile
-curve now reflect the uncertainty **after marginalising over changepoint
-locations**.  This is the appropriate PLE when the detected CPs are not fixed
-constants but also estimated quantities.
-"""
+Uses the same adaptive stepping, smoothing, and bisection refinement as
+`profile_parameter`. Returns a `ProfileResult` whose `cps_trace` records the
+optimal changepoints at each profile point."""
 function profile_parameter_joint(
     prob::ODEChangepointPLEProblem, idx::Int;
-    n_points::Int=20,
+    options::ProfileOptions=ProfileOptions(),
+    n_points::Union{Int,Nothing}=nothing,
     window::Int=7,
     step::Int=1,
-    optimizer::AbstractPLEOptimizer=default_de_config(),
+    min_seg::Int=10,
+    optimizer::AbstractPLEOptimizer=default_multistart_bobyqa_config(),
     threshold::Union{Real,Nothing}=nothing,
+    delta::Union{Real,Nothing}=nothing,
     parallelize_grid::Bool=true,
-    joint_reference::Union{Nothing,Tuple{Float64,Vector{Float64},Vector{Int}}}=nothing
+    cp_search::Symbol=:grid,
+    joint_reference::Union{Nothing,Tuple{Float64,Vector{Float64},Vector{Int}}}=nothing,
+    grid_fit=nothing
 )
-    best_params = prob.best_params
-    isempty(best_params) && error("ODEChangepointPLEProblem.best_params must be set")
-    cps0 = copy(prob.changepoints)
+    isempty(prob.best_params) && error("ODEChangepointPLEProblem.best_params must be set")
+    opt = _maybe_polish(optimizer, options)
+    verified = _verified_reference_loss(prob)
+    margin = _margin(threshold, delta, verified)
 
-    verified_loss = evaluate_loss(prob, best_params, cps0)
-    best_loss = if isfinite(prob.best_loss)
-        if abs(verified_loss - prob.best_loss) > 0.01 * max(1.0, abs(prob.best_loss))
-            @warn "Reference loss mismatch: prob.best_loss=$(prob.best_loss), evaluated=$(verified_loss). Using evaluated value."
-        end
-        min(prob.best_loss, verified_loss)
-    else
-        verified_loss
+    space = CPSearchSpace(prob.changepoints, window, prob.n_obs; step=step, min_seg=min_seg)
+    if grid_fit === nothing && joint_reference === nothing
+        grid_fit = joint_grid_fit(prob, window, opt; step=step, min_seg=min_seg,
+                                  parallelize_grid=parallelize_grid, cp_search=cp_search)
     end
-
-    # Threshold margin requested by the caller (χ²_0.95 by default).  Kept
-    # constant if the reference is replaced by the joint MLE below.
-    margin = threshold !== nothing ? Float64(threshold) - best_loss : CHISQ_95
-    if margin <= 0
-        margin = CHISQ_95
+    ref = joint_reference !== nothing ? joint_reference :
+          (grid_fit.best_loss, grid_fit.best_params, grid_fit.best_cps)
+    ref_loss, ref_params, ref_cps = ref
+    if verified < ref_loss
+        ref_loss, ref_params, ref_cps = verified, copy(prob.best_params), copy(prob.changepoints)
     end
+    ref_cps in space || error("joint reference changepoints $ref_cps are not in the search set")
 
-    # Adopt the joint MLE reference (all params + CPs re-fitted on the CP grid)
-    # when it improves on the conditional best fit.
-    if joint_reference !== nothing
-        ref_loss, ref_params, ref_cps = joint_reference
-        if ref_loss < best_loss - 1e-8
-            best_loss = ref_loss
-            best_params = ref_params
-            cps0 = copy(ref_cps)
-        end
-    end
-
-    best_val = best_params[idx]
-    user_threshold = best_loss + margin
-
-    lower_bound = prob.lb[idx]
-    upper_bound = prob.ub[idx]
-    range_width = upper_bound - lower_bound
-    threshold_margin = user_threshold - best_loss
-    if threshold_margin <= 0
-        threshold_margin = max(1e-6 * max(1.0, abs(best_loss)), 1e-12)
-        @warn "Non-positive threshold margin for parameter $idx; using floor $threshold_margin. The profile will likely be very narrow."
-    end
-
-    min_step = max(range_width / 1_000_000.0, 1e-12)
-    max_step = range_width / 2.0
-    step0 = if best_val > 0
-        min(range_width / 50.0, best_val * 0.05)
-    else
-        range_width / 50.0
-    end
-    step0 = clamp(step0, min_step, max_step)
-
-    values = Float64[best_val]
-    losses = Float64[best_loss]
-    params_trace = Vector{Float64}[copy(best_params)]
-    n_failed = 0
-    best_found = best_loss
-    best_found_params = copy(best_params)
-
-    # Warm-start state: current best (params, cps, loss)
-    current_params = copy(best_params)
-    current_cps = copy(cps0)
-
-    function _profile_direction(step_sign)
-        step_size = step0
-        current_val = best_val
-        x_warm = copy(best_params)
-        cps_warm = copy(cps0)
-        points_this_dir = 0
-
-        while points_this_dir < n_points
-            step_size = clamp(step_size, min_step, max_step)
-            candidate = current_val + step_sign * step_size
-            if step_sign < 0
-                candidate = max(candidate, lower_bound)
-            else
-                candidate = min(candidate, upper_bound)
+    # Secondary modes: CP vectors whose own optimum is (nearly) admissible. The
+    # profile must reach their parameter values, and their optima are used as
+    # additional warm starts, so disconnected confidence regions are found.
+    mode_starts = Dict{Vector{Int},Vector{Float64}}()
+    reach = (Inf, -Inf)
+    if grid_fit !== nothing
+        for (c, l, θ) in zip(grid_fit.grid, grid_fit.losses, grid_fit.params)
+            isfinite(l) || continue
+            if l <= ref_loss + options.stop_margin_factor * margin
+                mode_starts[c] = θ
             end
-            if (step_sign < 0 && candidate >= current_val) || (step_sign > 0 && candidate <= current_val)
-                break
+            if l <= ref_loss + margin
+                reach = (min(reach[1], θ[idx]), max(reach[2], θ[idx]))
             end
-
-            loss = Inf
-            θ = copy(x_warm)
-            cps = copy(cps_warm)
-            # Retry with a halved step when the joint optimisation fails
-            # outright; only give up (without recording a bogus point) after
-            # several attempts.
-            for attempt in 1:4
-                loss, θ, cps = _joint_optimize_cp_grid(prob, idx, candidate, cps_warm, window, x_warm, optimizer; step=step, parallelize_grid=parallelize_grid)
-                isfinite(loss) && break
-                if attempt < 4
-                    step_size *= 0.5
-                    step_size = clamp(step_size, min_step, max_step)
-                    candidate = current_val + step_sign * step_size
-                    candidate = step_sign < 0 ? max(candidate, lower_bound) : min(candidate, upper_bound)
-                end
-            end
-
-            if !isfinite(loss)
-                n_failed += 1
-                break
-            end
-
-            push!(values, candidate)
-            push!(losses, loss)
-            push!(params_trace, copy(θ))
-            points_this_dir += 1
-
-            if loss < best_found
-                best_found = loss
-                best_found_params = copy(θ)
-            end
-
-            # Update warm-starts for next step
-            x_warm = θ
-            cps_warm = cps
-            current_params = θ
-            current_cps = cps
-
-            Δ = loss - best_loss
-            if Δ > 2.0 * threshold_margin || (step_sign < 0 && candidate <= lower_bound) || (step_sign > 0 && candidate >= upper_bound)
-                break
-            end
-
-            if Δ < 0.3 * threshold_margin
-                step_size *= 1.5
-            elseif Δ > 0.8 * threshold_margin
-                step_size *= 0.5
-            end
-
-            current_val = candidate
         end
     end
 
-    _profile_direction(-1.0)
-    _profile_direction(1.0)
+    par = parallelize_grid && !uses_internal_threads(opt)
+    inner = _joint_inner(prob, idx, space, opt; parallel=par, cp_search=cp_search,
+                         mode_starts=mode_starts)
+    samplesize = n_points === nothing ? options.samplesize : n_points
 
-    perm = sortperm(values)
-    values = values[perm]
-    losses = losses[perm]
-    params_trace = params_trace[perm]
-
-    if best_found < best_loss - 0.1
-        @warn "Parameter $(prob.param_names[idx]): joint profiling found loss $best_found < reference $best_loss. The reference optimum may not be the true joint MLE."
+    result = nothing
+    for update in 0:options.max_reference_updates
+        result, _ = _profile_engine(prob, idx, ref_params, ref_cps, ref_loss, margin,
+                                    inner, options; samplesize=samplesize, reach=reach)
+        if options.allow_better_optimum && update < options.max_reference_updates &&
+           result.best_found_loss < ref_loss - options.better_optimum_tol
+            @warn "Joint profile of $(prob.param_names[idx]) found loss $(result.best_found_loss) < joint reference $ref_loss; restarting from the better optimum."
+            _, imin = findmin(result.losses)
+            r = refit_reference(_with_reference(prob, result.best_found_params,
+                                                result.best_found_loss;
+                                                changepoints=result.cps_trace[imin]);
+                                optimizer=opt)
+            ref_loss, ref_params, ref_cps = r.best_loss, r.best_params, r.changepoints
+            continue
+        end
+        break
     end
-
-    ci_lower, ci_upper, identifiable = ple_ci_interpolated(
-        values, losses, best_val, best_loss,
-        lower_bound, upper_bound, user_threshold
-    )
-
-    _, imin = findmin(losses)
-    best_found_params_from_trace = params_trace[imin]
-
-    label = prob.param_names[idx]
-    return ProfileResult(
-        label, idx, best_val, best_loss, ci_lower, ci_upper, identifiable, user_threshold,
-        values, losses, n_failed, best_found, best_found_params_from_trace
-    )
+    return result
 end
 
-"""    profile_all_parameters_joint(prob::ODEChangepointPLEProblem;
-                                   n_points=20, window=7, optimizer=default_de_config(),
-                                   indices=nothing, threshold=nothing)
+"""    profile_all_parameters_joint(prob; options=ProfileOptions(), window=7, step=1,
+                                 min_seg=10, optimizer=default_multistart_bobyqa_config(),
+                                 indices=nothing, threshold=nothing, delta=nothing,
+                                 parallel_over_parameters=true, cp_search=:grid,
+                                 reference_extra_starts=Vector{Float64}[], n_points=nothing,
+                                 joint_reference=nothing, grid_fit=nothing)
 
-Run `profile_parameter_joint` for every parameter (or a subset specified by
-`indices`) in parallel using `Base.Threads.@threads`."""
+Joint profiles of every parameter (or of `indices`), all anchored at one joint
+reference fit. If any profile finds a better optimum, the joint reference is
+replaced and all profiles are recomputed (`options.allow_better_optimum`)."""
 function profile_all_parameters_joint(
     prob::ODEChangepointPLEProblem;
-    n_points::Int=20,
+    options::ProfileOptions=ProfileOptions(),
+    n_points::Union{Int,Nothing}=nothing,
     window::Int=7,
     step::Int=1,
-    optimizer::AbstractPLEOptimizer=default_de_config(),
+    min_seg::Int=10,
+    optimizer::AbstractPLEOptimizer=default_multistart_bobyqa_config(),
     indices::Union{Nothing,Vector{Int}}=nothing,
     threshold::Union{Real,Vector{Float64},Nothing}=nothing,
+    delta::Union{Real,Vector{Float64},Nothing}=nothing,
     parallel_over_parameters::Bool=true,
     parallelize_grid::Bool=true,
-    reference_extra_starts::Vector{Vector{Float64}}=Vector{Float64}[]
+    cp_search::Symbol=:grid,
+    reference_extra_starts::Vector{Vector{Float64}}=Vector{Float64}[],
+    joint_reference::Union{Nothing,Tuple{Float64,Vector{Float64},Vector{Int}}}=nothing,
+    grid_fit=nothing
 )
     idxs = indices === nothing ? collect(1:length(prob.best_params)) : indices
+    opt = _maybe_polish(optimizer, options)
+    verified = _verified_reference_loss(prob)
+    margins = [_margin(threshold isa Vector ? threshold[k] : threshold,
+                       delta isa Vector ? delta[k] : delta, verified)
+               for k in eachindex(idxs)]
+
+    gfit = grid_fit !== nothing ? grid_fit :
+           joint_grid_fit(prob, window, opt; step=step, min_seg=min_seg,
+                          parallelize_grid=true, extra_starts=reference_extra_starts,
+                          cp_search=cp_search)
+    ref = joint_reference !== nothing ? joint_reference :
+          (gfit.best_loss, gfit.best_params, gfit.best_cps)
+    @info "Joint reference: loss=$(ref[1]) at cps=$(ref[3]) (conditional loss $(verified) at cps=$(prob.changepoints))"
+
+    inner_options = _with_options(options; allow_better_optimum=false, polish=false)
     profiles = Vector{ProfileResult}(undef, length(idxs))
-
-    # Establish the joint MLE reference once: re-fit all parameters on the
-    # discrete CP grid around prob.changepoints.  Joint profiles must be
-    # anchored at the joint MLE, not the conditional (fixed-CP) best fit.
-    ref_loss, ref_params, ref_cps = joint_reference_fit(prob, window, optimizer;
-                                                        step=step,
-                                                        parallelize_grid=!parallel_over_parameters,
-                                                        extra_starts=reference_extra_starts)
-    joint_ref = if ref_loss < prob.best_loss
-        @info "Joint reference fit improved the optimum: $(prob.best_loss) -> $ref_loss at cps=$ref_cps"
-        (ref_loss, ref_params, ref_cps)
-    else
-        nothing
-    end
-
-    # Avoid nested threading: if we parallelise over parameters, the inner CP-grid
-    # loop must be serial.  Conversely, when parameters are processed serially the
-    # CP grid can be threaded.
-    if parallel_over_parameters && !uses_internal_threads(optimizer)
-        Base.Threads.@threads for k in 1:length(idxs)
-            i = idxs[k]
-            thr = threshold isa Vector{Float64} ? threshold[k] : threshold
-            profiles[k] = profile_parameter_joint(prob, i;
-                                                  n_points=n_points,
-                                                  window=window,
-                                                  step=step,
-                                                  optimizer=optimizer,
-                                                  threshold=thr,
-                                                  parallelize_grid=false,
-                                                  joint_reference=joint_ref)
+    threaded_params = parallel_over_parameters && !uses_internal_threads(opt)
+    for update in 0:options.max_reference_updates
+        run_one = k -> profile_parameter_joint(prob, idxs[k]; options=inner_options,
+                                               n_points=n_points, window=window, step=step,
+                                               min_seg=min_seg, optimizer=opt,
+                                               delta=margins[k],
+                                               parallelize_grid=parallelize_grid && !threaded_params,
+                                               cp_search=cp_search, joint_reference=ref,
+                                               grid_fit=gfit)
+        if threaded_params
+            Base.Threads.@threads for k in eachindex(idxs)
+                profiles[k] = run_one(k)
+            end
+        else
+            for k in eachindex(idxs)
+                profiles[k] = run_one(k)
+            end
         end
-    else
-        for k in 1:length(idxs)
-            i = idxs[k]
-            thr = threshold isa Vector{Float64} ? threshold[k] : threshold
-            profiles[k] = profile_parameter_joint(prob, i;
-                                                  n_points=n_points,
-                                                  window=window,
-                                                  step=step,
-                                                  optimizer=optimizer,
-                                                  threshold=thr,
-                                                  parallelize_grid=parallelize_grid,
-                                                  joint_reference=joint_ref)
+        best_found, kbest = findmin([p.best_found_loss for p in profiles])
+        if options.allow_better_optimum && update < options.max_reference_updates &&
+           best_found < ref[1] - options.better_optimum_tol
+            p = profiles[kbest]
+            _, imin = findmin(p.losses)
+            @warn "Joint profile of $(p.parameter) found loss $best_found < joint reference $(ref[1]); re-profiling all parameters."
+            r = refit_reference(_with_reference(prob, p.best_found_params, best_found;
+                                                changepoints=p.cps_trace[imin]);
+                                optimizer=opt)
+            ref = (r.best_loss, r.best_params, r.changepoints)
+            continue
         end
+        break
     end
     sort!(profiles, by=p -> p.index)
     return profiles
@@ -580,8 +475,7 @@ end
 
 """    JointPLEConfig
 
-Configuration bundle for joint adaptive PLE.  Used to pass settings from the
-driver to the joint profiling functions."""
+Configuration bundle for joint adaptive PLE."""
 struct JointPLEConfig
     n_points::Int
     window::Int
@@ -592,13 +486,12 @@ struct JointPLEConfig
 end
 
 function JointPLEConfig(;
-    n_points::Int=20,
+    n_points::Int=100,
     window::Int=7,
     step::Int=1,
-    optimizer::AbstractPLEOptimizer=default_de_config(),
+    optimizer::AbstractPLEOptimizer=default_multistart_bobyqa_config(),
     parallel_over_parameters::Bool=true,
     parallelize_grid::Bool=true
 )
     return JointPLEConfig(n_points, window, step, optimizer, parallel_over_parameters, parallelize_grid)
 end
-

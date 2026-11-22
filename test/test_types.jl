@@ -3,14 +3,14 @@ using Test
 
 @testset "ODEChangepointPLEProblem construction" begin
     data = ones(1, 10)
-    lb = [0.0, 0.0]
-    ub = [1.0, 1.0]
+    lb = [0.0, 0.0, 0.0]
+    ub = [1.0, 1.0, 1.0]
 
     prob = ODEChangepointPLEProblem(
         data = data,
         loss_fn = (sim, data) -> 0.0,
         changepoints = [5],
-        best_params = [0.5, 0.5],
+        best_params = [0.5, 0.5, 0.5],
         lb = lb,
         ub = ub,
         n_global = 1,
@@ -22,7 +22,7 @@ using Test
     @test prob.n_global == 1
     @test prob.n_segment_specific == 1
     @test prob.n_obs == 10
-    @test length(prob) == 2
+    @test length(prob) == 3
     @test prob.param_names == ["par_1", "par_2_seg1", "par_2_seg2"]
 
     # User-supplied parameter labels
@@ -30,22 +30,22 @@ using Test
         data = data,
         loss_fn = (sim, data) -> 0.0,
         changepoints = [5],
-        best_params = [0.5, 0.5],
+        best_params = [0.5, 0.5, 0.5],
         lb = lb,
         ub = ub,
-        param_names = ["a", "b"],
+        param_names = ["a", "b", "c"],
         n_global = 1,
         n_segment_specific = 1
     )
-    @test prob2.param_names == ["a", "b"]
+    @test prob2.param_names == ["a", "b", "c"]
 
     @test_throws AssertionError ODEChangepointPLEProblem(
         data = data,
         loss_fn = (sim, data) -> 0.0,
         changepoints = [5],
-        best_params = [0.5, 0.5],
+        best_params = [0.5, 0.5, 0.5],
         lb = [0.0],
-        ub = [1.0, 1.0],
+        ub = [1.0, 1.0, 1.0],
         n_global = 1,
         n_segment_specific = 1
     )
@@ -57,6 +57,18 @@ using Test
         best_params = [0.5],
         lb = lb,
         ub = ub,
+        n_global = 1,
+        n_segment_specific = 1
+    )
+
+    # Parameter vector inconsistent with the number of segments
+    @test_throws AssertionError ODEChangepointPLEProblem(
+        data = data,
+        loss_fn = (sim, data) -> 0.0,
+        changepoints = [5],
+        best_params = [0.5, 0.5],
+        lb = [0.0, 0.0],
+        ub = [1.0, 1.0],
         n_global = 1,
         n_segment_specific = 1
     )

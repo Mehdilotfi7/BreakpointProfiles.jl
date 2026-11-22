@@ -115,6 +115,7 @@ struct MetaheuristicsDEConfig <: AbstractPLEOptimizer
     max_evals::Int
     parallel::Bool
     warm_start_perturbation::Float64  # relative perturbation around x0 for warm-start population
+    seed::Union{Int,Nothing}
 end
 
 function MetaheuristicsDEConfig(;
@@ -123,9 +124,10 @@ function MetaheuristicsDEConfig(;
     CR::Float64=0.9,
     max_evals::Int=150_000,
     parallel::Bool=true,
-    warm_start_perturbation::Float64=0.5
+    warm_start_perturbation::Float64=0.5,
+    seed::Union{Int,Nothing}=nothing
 )
-    return MetaheuristicsDEConfig(population, F, CR, max_evals, parallel, warm_start_perturbation)
+    return MetaheuristicsDEConfig(population, F, CR, max_evals, parallel, warm_start_perturbation, seed)
 end
 
 """    default_de_config
@@ -211,14 +213,19 @@ function optimize_ple(f, x0, lb, ub, optimizer::MetaheuristicsDEConfig)
     # matrix where each row is a candidate solution and expects a vector of fitness
     # values in return. We wrap the scalar objective in a threaded batch evaluator.
     bounds = hcat(lb, ub)
-    options = Metaheuristics.Options(f_calls_limit=optimizer.max_evals, parallel_evaluation=optimizer.parallel)
+    options = optimizer.seed === nothing ?
+              Metaheuristics.Options(f_calls_limit=optimizer.max_evals, parallel_evaluation=optimizer.parallel) :
+              Metaheuristics.Options(f_calls_limit=optimizer.max_evals, parallel_evaluation=optimizer.parallel,
+                                     seed=UInt(optimizer.seed))
+    rng = optimizer.seed === nothing ? Random.default_rng() : Random.MersenneTwister(optimizer.seed)
 
     # Warm-start DE with x0: one individual is the provided initial point, the rest
     # are small random perturbations inside the bounds. This is critical for the MICA
     # PLE problem because the loss landscape is rugged and wide uniform random
     # sampling misses the good basin around the MICA fit.
     initial_state = make_de_initial_state(f, x0, lb, ub, optimizer.population;
-                                          perturbation=optimizer.warm_start_perturbation)
+                                          perturbation=optimizer.warm_start_perturbation,
+                                          rng=rng)
 
     de = Metaheuristics.DE(
         N=optimizer.population,
@@ -237,7 +244,7 @@ end
 Create a Metaheuristics.State for DE warm-started at `x0`. The first individual is
 `x0` itself; the remaining `N-1` individuals are random perturbations around `x0`
 that stay within `[lb, ub]`."""
-function make_de_initial_state(f, x0, lb, ub, N; perturbation=0.5)
+function make_de_initial_state(f, x0, lb, ub, N; perturbation=0.5, rng=Random.default_rng())
     best_sol = Metaheuristics.create_child(copy(x0), f(x0))
     population = [best_sol]
     n = length(x0)
@@ -245,7 +252,7 @@ function make_de_initial_state(f, x0, lb, ub, N; perturbation=0.5)
     for i in 2:N
         x_pert = copy(x0)
         for j in 1:n
-            δ = perturbation * range[j] * (2.0 * rand() - 1.0)
+            δ = perturbation * range[j] * (2.0 * rand(rng) - 1.0)
             x_pert[j] = clamp(x_pert[j] + δ, lb[j], ub[j])
         end
         push!(population, Metaheuristics.create_child(x_pert, f(x_pert)))
@@ -283,8 +290,10 @@ box `[lb, ub]`.
 This is useful as a pre-processing step for ODE+PLE problems where a single local
 re-optimization from the MICA fit can miss better basins.  The best reference found is
 then used as the MICA-loss baseline and starting point for the actual PLE."""
-function multi_start_reference_search(f, x0, lb, ub, optimizer::AbstractPLEOptimizer, n_starts::Int; perturbation::Float64=0.5)
+function multi_start_reference_search(f, x0, lb, ub, optimizer::AbstractPLEOptimizer, n_starts::Int;
+                                      perturbation::Float64=0.5, seed::Union{Int,Nothing}=nothing)
     n_starts >= 1 || error("n_starts must be >= 1")
+    rng = seed === nothing ? Random.default_rng() : Random.MersenneTwister(seed)
     n = length(x0)
     range = ub .- lb
 
@@ -297,7 +306,7 @@ function multi_start_reference_search(f, x0, lb, ub, optimizer::AbstractPLEOptim
         else
             x_pert = copy(x0)
             for j in 1:n
-                δ = perturbation * range[j] * (2.0 * rand() - 1.0)
+                δ = perturbation * range[j] * (2.0 * rand(rng) - 1.0)
                 x_pert[j] = clamp(x_pert[j] + δ, lb[j], ub[j])
             end
             x_pert
@@ -370,15 +379,17 @@ struct MultiStartBOBYQAConfig <: AbstractPLEOptimizer
     maxeval::Int
     xtol_rel::Float64
     perturbation::Float64
+    seed::Union{Int,Nothing}
 end
 
 function MultiStartBOBYQAConfig(;
     n_starts::Int=5,
     maxeval::Int=2000,
     xtol_rel::Float64=1.0e-6,
-    perturbation::Float64=0.1
+    perturbation::Float64=0.1,
+    seed::Union{Int,Nothing}=nothing
 )
-    return MultiStartBOBYQAConfig(n_starts, maxeval, xtol_rel, perturbation)
+    return MultiStartBOBYQAConfig(n_starts, maxeval, xtol_rel, perturbation, seed)
 end
 
 """    default_multistart_bobyqa_config
@@ -392,13 +403,14 @@ function optimize_ple(f, x0, lb, ub, optimizer::MultiStartBOBYQAConfig)
     best_x = copy(x0)
 
     # Generate starting points: x0 + (n_starts-1) perturbed copies
+    rng = optimizer.seed === nothing ? Random.default_rng() : Random.MersenneTwister(optimizer.seed)
     starts = Vector{Vector{Float64}}(undef, optimizer.n_starts)
     starts[1] = copy(x0)
     for s in 2:optimizer.n_starts
         x_pert = copy(x0)
         for j in 1:n
             range_j = ub[j] - lb[j]
-            δ = optimizer.perturbation * range_j * (2.0 * rand() - 1.0)
+            δ = optimizer.perturbation * range_j * (2.0 * rand(rng) - 1.0)
             x_pert[j] = clamp(x_pert[j] + δ, lb[j], ub[j])
         end
         starts[s] = x_pert
@@ -496,5 +508,7 @@ function solve_problem(prob::ODEChangepointPLEProblem, optimizer::AbstractPLEOpt
     ub = prob.ub[1:n_params]
     x0 = prob.best_params[1:n_params]
     f = x -> evaluate_loss(prob, x)
-    return optimize_ple(f, x0, lb, ub, optimizer)
+    l0 = f(x0)
+    l, x = optimize_ple(f, x0, lb, ub, optimizer)
+    return (isfinite(l) && l <= l0) ? (l, x) : (l0, x0)
 end

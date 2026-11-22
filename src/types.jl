@@ -18,7 +18,11 @@ set of changepoints.
   is used directly by the profiler. Otherwise the package falls back to `simulator`
   or to the generic ODE segment solver.
 - `simulator`: optional function `(params, changepoints) -> simulation matrix`.
-- `ode_function`: ODE RHS `(du, u, p, t)` for the generic segment solver.
+- `ode_function`: ODE RHS `(du, u, p, t)` for the generic segment solver. Inside
+  segment `j` the solver passes `p = [θ_global; θ_segment_j]`, i.e. the
+  `n_global` global parameters followed by the `n_segment_specific` parameters
+  of the active segment, so the right-hand side never needs to know the
+  changepoint locations.
 - `u0`: initial condition for the generic solver.
 - `tspan`: time span `(t0, tf)` for the generic solver.
 - `data`: observed data, channels × time.
@@ -71,13 +75,17 @@ function ODEChangepointPLEProblem(;
 )
     @assert length(lb) == length(ub) "lower and upper bounds must have the same length"
     @assert length(best_params) == length(lb) "best_params must match bounds length"
+    n_expected = n_global + n_segment_specific * (length(changepoints) + 1)
+    @assert length(best_params) == n_expected "best_params has length $(length(best_params)) but n_global + n_segment_specific * (n_changepoints + 1) = $n_expected"
+    @assert all(lb .<= ub) "lower bounds must not exceed upper bounds"
     if isempty(param_names)
         param_names = parameter_labels(n_global, n_segment_specific, length(changepoints))
     end
     return ODEChangepointPLEProblem(
         objective, simulator, ode_function, u0, tspan,
         data, loss_fn, sort(collect(Int, changepoints)),
-        best_params, best_loss, lb, ub, param_names,
+        collect(Float64, best_params), Float64(best_loss),
+        collect(Float64, lb), collect(Float64, ub), collect(String, param_names),
         n_global, n_segment_specific, n_obs
     )
 end
@@ -98,6 +106,9 @@ Result of profiling a single scalar parameter.
 - `n_failed`: number of grid points where the inner optimizer returned `Inf`.
 - `best_found_loss`: lowest loss found during profiling (may be < `best_loss`
   if the reference optimum was not the true MLE).
+- `best_found_params`: full parameter vector at `best_found_loss`.
+- `cps_trace`: changepoint vector used at each profile point (constant for
+  conditional profiles, re-optimised for joint profiles).
 """
 struct ProfileResult
     parameter::String
@@ -113,11 +124,25 @@ struct ProfileResult
     n_failed::Int
     best_found_loss::Float64
     best_found_params::Vector{Float64}
+    cps_trace::Vector{Vector{Int}}
+end
+
+function ProfileResult(parameter, index, best_value, best_loss, ci_lower, ci_upper,
+                       identifiable, threshold, values, losses, n_failed,
+                       best_found_loss, best_found_params)
+    return ProfileResult(parameter, index, best_value, best_loss, ci_lower, ci_upper,
+                         identifiable, threshold, values, losses, n_failed,
+                         best_found_loss, best_found_params,
+                         [Int[] for _ in eachindex(values)])
 end
 
 """    CPProfileResult
 
-Result of profiling the location of a single changepoint."""
+Result of profiling the location of a single changepoint.
+
+`best_loss` is the reference loss of the profile: the minimum of the loss at the
+supplied fit and of all re-optimised losses in the window, so that
+`losses .- best_loss >= 0`."""
 struct CPProfileResult
     cp_index::Int
     original_cp::Int
@@ -168,11 +193,22 @@ D2D-style configuration for 1-D profile-likelihood exploration.
 - `polish`: if `true`, polish the result of every global/metaheuristic inner
   optimization with a local optimizer (LBFGS/BOBYQA).
 - `allow_better_optimum`: if `true` and profiling finds a loss lower than the
-  reference `best_loss`, update the reference optimum from the profile.
+  reference `best_loss`, replace the reference with the better optimum and
+  restart profiling (see `max_reference_updates`).
 - `smooth_jumps`: if `true`, apply D2D `pleSmooth`-style post-processing to remove
   local jumps caused by sub-optimal inner optimizations.
 - `jump_tol`: Δloss drop used to flag a local jump during smoothing.
 - `max_trial_redos`: maximum number of step-size reductions per outward step.
+- `refine_ci`: if `true`, refine each threshold crossing by bisection with
+  re-optimisation, so the reported CI endpoint does not depend on the profile
+  grid spacing.
+- `ci_refine_iters`: maximum number of bisection steps per crossing.
+- `refit_reference`: if `true`, re-optimise all free quantities from
+  `best_params` before profiling so the profile is anchored at an optimum.
+- `max_reference_updates`: when `allow_better_optimum` is `true` and a profile
+  finds a loss below the reference by more than `better_optimum_tol`, the
+  reference is replaced and profiling restarts (at most this many times).
+- `better_optimum_tol`: absolute loss tolerance for declaring a better optimum.
 """
 struct ProfileOptions
     samplesize::Int
@@ -186,6 +222,11 @@ struct ProfileOptions
     smooth_jumps::Bool
     jump_tol::Float64
     max_trial_redos::Int
+    refine_ci::Bool
+    ci_refine_iters::Int
+    refit_reference::Bool
+    max_reference_updates::Int
+    better_optimum_tol::Float64
 end
 
 function ProfileOptions(;
@@ -196,14 +237,21 @@ function ProfileOptions(;
     max_step_factor::Float64=0.5,
     stop_margin_factor::Float64=1.2,
     polish::Bool=true,
-    allow_better_optimum::Bool=false,
+    allow_better_optimum::Bool=true,
     smooth_jumps::Bool=true,
-    jump_tol::Float64=0.5,
-    max_trial_redos::Int=20
+    jump_tol::Float64=0.1,
+    max_trial_redos::Int=20,
+    refine_ci::Bool=true,
+    ci_refine_iters::Int=12,
+    refit_reference::Bool=true,
+    max_reference_updates::Int=3,
+    better_optimum_tol::Float64=1.0e-3
 )
     return ProfileOptions(
         samplesize, rel_step_increase, step_factor,
         min_step_factor, max_step_factor, stop_margin_factor,
-        polish, allow_better_optimum, smooth_jumps, jump_tol, max_trial_redos
+        polish, allow_better_optimum, smooth_jumps, jump_tol, max_trial_redos,
+        refine_ci, ci_refine_iters, refit_reference, max_reference_updates,
+        better_optimum_tol
     )
 end

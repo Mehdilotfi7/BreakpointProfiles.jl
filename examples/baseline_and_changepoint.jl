@@ -1,5 +1,6 @@
 using BreakpointProfiles
 using DataFrames
+using Plots
 
 optimizer = NLoptPLEConfig(algorithm=:LN_BOBYQA, xtol_rel=1e-5, maxeval=2000)
 options = ProfileOptions(samplesize=20, polish=false, smooth_jumps=false)
@@ -59,3 +60,19 @@ joint = profile_all_parameters_joint(
 )
 println("\nJoint profile")
 show(ple_summary(joint), allcols=true, allrows=true)
+
+figure_dir = joinpath(@__DIR__, "..", "docs", "src", "assets", "examples")
+mkpath(figure_dir)
+fig = plot_profiles(baseline_profiles)
+plot!(fig, size=(1000, 400), plot_title="Baseline profile likelihood")
+savefig(fig, joinpath(figure_dir, "baseline_profiles.png"))
+fig = plot_profiles(conditional)
+plot!(fig, size=(1400, 400), plot_title="Conditional profile likelihood")
+savefig(fig, joinpath(figure_dir, "conditional_profiles.png"))
+fig = plot_cp_profiles([cp_profile], cp_profile.best_loss + chi2_threshold(1, 0.95))
+plot!(fig, size=(700, 500), plot_title="Changepoint-location profile likelihood")
+savefig(fig, joinpath(figure_dir, "changepoint_profile.png"))
+fig = plot_profiles(joint)
+plot!(fig, size=(700, 400), plot_title="Joint profile likelihood")
+savefig(fig, joinpath(figure_dir, "joint_profile.png"))
+println("\nSaved documentation figures to $figure_dir")
