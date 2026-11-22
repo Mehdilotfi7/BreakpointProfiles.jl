@@ -20,12 +20,11 @@ The adaptive profile-likelihood engine and the confidence-interval extraction in
 
 ## Installation
 
-The package is not yet registered in the Julia General registry. Install it
-from GitHub:
+Install the package from the Julia General registry:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/Mehdilotfi7/BreakpointProfiles.jl")
+Pkg.add("BreakpointProfiles")
 ```
 
 Or clone the repository and develop it locally:
