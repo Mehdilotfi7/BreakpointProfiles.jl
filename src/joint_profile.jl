@@ -401,7 +401,26 @@ end
 
 Joint profiles of every parameter (or of `indices`), all anchored at one joint
 reference fit. If any profile finds a better optimum, the joint reference is
-replaced and all profiles are recomputed (`options.allow_better_optimum`)."""
+replaced and all profiles are recomputed (`options.allow_better_optimum`).
+
+Keyword arguments (besides those of [`profile_parameter_joint`](@ref)):
+- `window`, `step`, `min_seg`: the changepoint search set — every changepoint
+  may move within `±window` of its detected position in steps of `step`, and
+  no segment may be shorter than `min_seg`. A window that is too narrow cuts
+  the profile off; a wide window with several changepoints makes the grid large.
+- `cp_search`: `:grid` optimises every changepoint vector of the search set at
+  each profile point (exact, cost grows with the grid size); `:local` uses a
+  coordinate search from the current changepoints (much cheaper, may miss
+  distant modes).
+- `parallelize_grid`: fit the changepoint vectors of the grid in parallel
+  threads (ignored for optimisers that are threaded themselves).
+- `parallel_over_parameters`: profile the parameters in parallel threads.
+- `reference_extra_starts`: additional starting vectors for the joint
+  reference fit (useful when the default starts miss the global optimum).
+- `joint_reference`: a precomputed `(loss, params, cps)` joint optimum; skips
+  the reference fit.
+- `grid_fit`: a precomputed result of [`joint_grid_fit`](@ref); skips the grid
+  fit and supplies the secondary modes used to find disconnected intervals."""
 function profile_all_parameters_joint(
     prob::ODEChangepointPLEProblem;
     options::ProfileOptions=ProfileOptions(),

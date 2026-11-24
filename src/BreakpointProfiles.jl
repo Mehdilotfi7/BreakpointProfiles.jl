@@ -72,7 +72,12 @@ export AbstractPLEProblem,
        print_summary_table,
        plot_profiles,
        plot_cp_profiles,
-       plot_profile_panels
+       plot_profile_panels,
+       extend_profile,
+       extend_profiles,
+       extended_bounds,
+       extension_summary,
+       profile_open_sides
 
 include("types.jl")
 include("baseline.jl")
@@ -81,6 +86,7 @@ include("optimizers.jl")
 include("parameter_profile.jl")
 include("changepoint_profile.jl")
 include("joint_profile.jl")
+include("profile_extension.jl")
 include("summary.jl")
 
 end

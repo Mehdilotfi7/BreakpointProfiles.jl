@@ -109,6 +109,12 @@ Result of profiling a single scalar parameter.
 - `best_found_params`: full parameter vector at `best_found_loss`.
 - `cps_trace`: changepoint vector used at each profile point (constant for
   conditional profiles, re-optimised for joint profiles).
+- `params_trace`: full optimised parameter vector at each profile point (empty
+  for results built without it). Used by `extend_profile` to continue a profile
+  without recomputing it.
+- `profile_lb`, `profile_ub`: range over which the parameter was profiled
+  (the problem bounds, or the extended range after `extend_profile`);
+  `-Inf`/`Inf` when unknown.
 """
 struct ProfileResult
     parameter::String
@@ -125,6 +131,18 @@ struct ProfileResult
     best_found_loss::Float64
     best_found_params::Vector{Float64}
     cps_trace::Vector{Vector{Int}}
+    params_trace::Vector{Vector{Float64}}
+    profile_lb::Float64
+    profile_ub::Float64
+end
+
+function ProfileResult(parameter, index, best_value, best_loss, ci_lower, ci_upper,
+                       identifiable, threshold, values, losses, n_failed,
+                       best_found_loss, best_found_params, cps_trace)
+    return ProfileResult(parameter, index, best_value, best_loss, ci_lower, ci_upper,
+                         identifiable, threshold, values, losses, n_failed,
+                         best_found_loss, best_found_params, cps_trace,
+                         Vector{Float64}[], -Inf, Inf)
 end
 
 function ProfileResult(parameter, index, best_value, best_loss, ci_lower, ci_upper,

@@ -176,8 +176,8 @@ end
 
 Estimate per-channel σ from the residuals between `sim` and `data` on log scale.
 
-If `data_indices` is provided (e.g. `[5, 6, 7, 9, 11]` for the COVID model),
-it maps data rows to simulation rows.  Otherwise a 1:1 mapping is assumed
+If `data_indices` is provided (e.g. `[5, 6, 7, 9, 11]` when only some
+simulated states are observed), it maps data rows to simulation rows.  Otherwise a 1:1 mapping is assumed
 (data and sim have the same number of rows).
 
 Returns a `Vector{Float64}` of length `size(data, 1)`.

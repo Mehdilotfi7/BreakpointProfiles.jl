@@ -91,7 +91,17 @@ function to_profile_dataframe(profiles::Vector{ProfileResult})
     return df
 end
 
-"""Plot profile-likelihood curves when Plots.jl is loaded."""
+"""
+    plot_profiles(profiles; filename=nothing, title="Profile-likelihood curves",
+                  reference_bounds=nothing)
+
+Plot profile-likelihood curves (requires Plots.jl). One panel per profile, up
+to four columns; the number of rows follows from the number of profiles.
+Each panel shows the profile (blue), the threshold (red dashed), the estimate
+(green dashed) and the confidence interval (gold). `reference_bounds =
+(lb, ub)` (vectors indexed by parameter index, e.g. the problem bounds) draws
+those bounds as grey dotted lines, which marks the extended part of profiles
+returned by [`extend_profiles`](@ref)."""
 function plot_profiles end
 
 """Plot changepoint-location profile curves when Plots.jl is loaded."""

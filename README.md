@@ -132,6 +132,9 @@ profiling method or confidence threshold.
 - Multiple optimiser backends: GA (Evolutionary.jl), differential evolution (Metaheuristics.jl), LBFGS (Optim.jl), BOBYQA (NLopt.jl), and multi-start/hybrid pipelines.
 - Likelihood options: Gaussian (L2), Laplace (L1), log-scale, and custom losses.
 - Identifiability assessment and confidence-interval extraction.
+- **Profile extension** beyond the parameter bounds (`extend_profile`,
+  `extend_profiles`) to check whether intervals that are open at a bound close
+  further out, without recomputing the existing profile.
 - CSV/DataFrame export, Markdown reports, and plotting utilities.
 
 ## Losses and thresholds
@@ -154,6 +157,37 @@ The threshold is `reference_loss + delta`. By default the reference fit is
 re-optimised before profiling (`ProfileOptions(refit_reference=true)`), and if
 a profile finds a better optimum the reference is replaced and all profiles
 are recomputed (`allow_better_optimum=true`).
+
+## Profiling options
+
+`ProfileOptions` has 16 settings that control the adaptive stepping
+(`samplesize`, `rel_step_increase`, `step_factor`, `min_step_factor`,
+`max_step_factor`, `stop_margin_factor`, `max_trial_redos`), reliability
+(`polish`, `smooth_jumps`, `jump_tol`, `refit_reference`,
+`allow_better_optimum`, `max_reference_updates`, `better_optimum_tol`) and
+interval precision (`refine_ci`, `ci_refine_iters`). Their effects on the
+profiles and on the runtime are explained on the
+[Profiling options](https://mehdilotfi7.github.io/BreakpointProfiles.jl/dev/profiling_options/)
+documentation page. Step sizes are fractions of the parameter range, so the
+same settings work for parameters on different scales.
+
+## Extending profiles beyond the bounds
+
+A profile that reaches a bound below the threshold is reported as
+non-identifiable, although the bound may simply be too tight.
+`extend_profile` continues it beyond the bound — on the `:left`, `:right` or
+`:both` sides, by relative amounts — keeping every point already computed:
+
+```julia
+extended = extend_profiles(prob, profiles; left=0.5, right=0.5)  # +50 % of the range
+df = extension_summary(profiles, extended)
+count(df.identifiable_after .& .!df.identifiable_before)  # newly identifiable
+```
+
+`mode=:range` (default) extends by a fraction of the parameter range,
+`mode=:relative` by a fraction of the bound value (multiplicative, for positive
+parameters). Only the profiled parameter leaves its bounds; all other
+parameters keep theirs.
 
 ## Changepoints in the generic ODE path
 

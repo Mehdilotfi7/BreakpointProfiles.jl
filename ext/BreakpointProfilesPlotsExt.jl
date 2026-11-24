@@ -4,7 +4,8 @@ using BreakpointProfiles
 using Plots
 
 function BreakpointProfiles.plot_profiles(profiles::Vector{ProfileResult}; filename=nothing,
-                                          title::String="Profile-likelihood curves")
+                                          title::String="Profile-likelihood curves",
+                                          reference_bounds=nothing)
     n = length(profiles)
     ncols = min(4, n)
     nrows = ceil(Int, n / ncols)
@@ -24,6 +25,10 @@ function BreakpointProfiles.plot_profiles(profiles::Vector{ProfileResult}; filen
         if p.ci_lower < p.ci_upper
             lo, hi = minmax(p.ci_lower, p.ci_upper)
             vline!(fig[i], [lo, hi], color=:gold, alpha=0.25, label="")
+        end
+        if reference_bounds !== nothing
+            rlo, rhi = reference_bounds[1][p.index], reference_bounds[2][p.index]
+            vline!(fig[i], [rlo, rhi], color=:gray40, ls=:dot, lw=1.2, label="")
         end
         plot!(fig[i], xlabel="parameter value", ylabel="loss", title=p.parameter,
               titlefontsize=9, xscale=use_log ? :log10 : :identity,

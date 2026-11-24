@@ -182,14 +182,19 @@ function _profile_engine(prob, idx, ref_params, ref_cps, ref_loss, margin, inner
     result = ProfileResult(
         prob.param_names[idx], idx, best_val, ref_loss, ci_lower, ci_upper,
         identifiable, threshold, copy(tr.values), copy(tr.losses), n_failed,
-        best_found, copy(tr.params[imin]), copy(tr.cps)
+        best_found, copy(tr.params[imin]), copy(tr.cps),
+        [copy(θ) for θ in tr.params], lower_bound, upper_bound
     )
     return result, tr
 end
 
 function _engine_direction!(tr, prob, idx, ref_params, ref_cps, ref_loss, margin, inner,
                             options, direction, step0, min_step, max_step, samplesize,
-                            reach_val::Float64=(direction < 0 ? Inf : -Inf))
+                            reach_val::Float64=(direction < 0 ? Inf : -Inf);
+                            start_loss::Float64=ref_loss)
+    # `ref_params`/`start_loss` give the point the walk starts from (the
+    # reference optimum, or the outermost point of an existing profile when it
+    # is extended); `ref_loss` is the profile reference used for stopping.
     lower_bound = prob.lb[idx]
     upper_bound = prob.ub[idx]
     target = options.rel_step_increase * margin
@@ -197,7 +202,7 @@ function _engine_direction!(tr, prob, idx, ref_params, ref_cps, ref_loss, margin
     cur_val = ref_params[idx]
     cur_params = collect(Float64, ref_params)
     cur_cps = collect(Int, ref_cps)
-    cur_loss = ref_loss
+    cur_loss = start_loss
     prev_val = NaN
     prev_params = cur_params
     step = step0
@@ -417,7 +422,8 @@ end
     profile_parameter(prob::ODEChangepointPLEProblem, idx::Int;
                       options=ProfileOptions(),
                       optimizer=default_multistart_bobyqa_config(),
-                      threshold=nothing, delta=nothing)
+                      threshold=nothing, delta=nothing,
+                      method=nothing, n_points=nothing)
 
 Conditional profile likelihood of parameter `idx`: the changepoints are held
 fixed at `prob.changepoints` and all other parameters are re-optimised at each
@@ -430,7 +436,23 @@ converted to a margin relative to the loss at `prob.best_params`.
 
 With `options.refit_reference` the reference is first re-optimised; with
 `options.allow_better_optimum` the profile is restarted from any better optimum
-it discovers (up to `options.max_reference_updates` times)."""
+it discovers (up to `options.max_reference_updates` times).
+
+Keyword arguments:
+- `options`: stepping, smoothing and CI settings, see [`ProfileOptions`](@ref).
+- `optimizer`: inner optimiser used at every profile point (the main driver of
+  runtime and of profile quality).
+- `delta` / `threshold`: confidence level, as described above.
+- `method`: `:adaptive` (default, D2D-style adaptive steps) or `:fixed` (a
+  fixed grid of `n_points` values around the estimate, clipped to the bounds:
+  log-spaced over `[best/5, 5·best]` when the parameter is positive and its
+  bounds span more than a factor 10, otherwise linear over `best ± half the
+  bound range`).
+- `n_points`: for `:adaptive`, overrides `options.samplesize` (maximum steps
+  per direction); for `:fixed`, the number of grid points (default 20).
+
+A profile that is open at a parameter bound can be continued beyond it with
+[`extend_profile`](@ref)."""
 function profile_parameter(
     prob::ODEChangepointPLEProblem, idx::Int;
     options::ProfileOptions=ProfileOptions(),
@@ -483,14 +505,19 @@ end
 """
     profile_all_parameters(prob; options=ProfileOptions(),
                            optimizer=default_multistart_bobyqa_config(),
-                           indices=nothing, threshold=nothing, delta=nothing)
+                           indices=nothing, threshold=nothing, delta=nothing,
+                           method=nothing, n_points=nothing)
 
 Conditional profiles of every parameter (or of `indices`). All profiles share
 one reference fit: the reference is re-fitted once (`options.refit_reference`)
 and, if any profile finds a better optimum, the reference is replaced and *all*
 profiles are recomputed (`options.allow_better_optimum`). Parameters are
 profiled in parallel with `Threads.@threads` unless the optimiser is itself
-threaded. Returns a `Vector{ProfileResult}` ordered by parameter index."""
+threaded. Returns a `Vector{ProfileResult}` ordered by parameter index.
+
+Keyword arguments are those of [`profile_parameter`](@ref), plus `indices`
+(the parameters to profile, default all). `threshold` and `delta` may also be
+vectors with one entry per profiled parameter."""
 function profile_all_parameters(
     prob::ODEChangepointPLEProblem;
     options::ProfileOptions=ProfileOptions(),
@@ -577,7 +604,8 @@ function _profile_fixed(prob, idx, margin, n_points, optimizer)
     return ProfileResult(
         prob.param_names[idx], idx, best_val, ref_loss, ci_lower, ci_upper,
         identifiable, threshold, tr.values, tr.losses, n_failed, best_found,
-        tr.params[imin], tr.cps)
+        tr.params[imin], tr.cps, [copy(θ) for θ in tr.params],
+        prob.lb[idx], prob.ub[idx])
 end
 
 function _fixed_grid(lower, upper, best_val, n_points)

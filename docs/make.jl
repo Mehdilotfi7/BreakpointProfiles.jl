@@ -14,8 +14,9 @@ makedocs(
     modules = [BreakpointProfiles],
     pages = [
         "Home" => "index.md",
-        "API" => "api.md",
-        "Examples" => "examples.md"
+        "Profiling options" => "profiling_options.md",
+        "Examples" => "examples.md",
+        "API" => "api.md"
     ],
     remotes = nothing
 )

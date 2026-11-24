@@ -72,10 +72,12 @@ write_profiles("ple_results.csv", [prof])
 * Multiple optimiser backends: Evolutionary (GA), Metaheuristics (DE), Optim (LBFGS), NLopt (BOBYQA), and multi-start/hybrid pipelines.
 * Built-in Gaussian and Laplace negative log-likelihoods plus custom losses.
 * Confidence-interval extraction and practical identifiability checks.
+* Profile extension beyond the parameter bounds (`extend_profile`) to tell flat likelihoods from bounds that are too tight.
 * CSV/DataFrame export, Markdown reports, and optional plotting helpers.
 
 ## Next steps
 
+* See [Profiling options](profiling_options.md) for what each profiling argument does and how it affects the result and the runtime, and for extending profiles beyond the bounds.
 * See the [API reference](api.md) for a complete list of types and functions.
 * See the [Examples](examples.md) page for a self-contained baseline and changepoint-aware workflow.
 

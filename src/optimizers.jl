@@ -3,8 +3,8 @@
 
 Genetic-algorithm configuration for the inner PLE optimisation.
 
-Fields are string-encoded so that the exact GA used for the MICA COVID-19
-change-point analysis can be reproduced:
+Fields are string-encoded so that a GA configuration can be stored and
+reproduced exactly, for example:
 
 ```julia
 EvolutionaryPLEConfig(
@@ -98,8 +98,7 @@ default_evolutionary_config(; kwargs...) = EvolutionaryPLEConfig(; kwargs...)
 Differential-Evolution (DE) configuration using Metaheuristics.jl for the inner
 PLE optimisation.
 
-DE is generally more robust than a GA on high-dimensional, rugged landscapes,
-which is why it is preferred for the COVID-19 MICA PLE problem.
+DE is generally more robust than a GA on high-dimensional, rugged landscapes.
 
 Fields:
 - `population`: population size N (default 150)
@@ -447,9 +446,8 @@ Stage 1: run a global/metaheuristic optimizer (`global_optimizer`) to locate a g
 basin.  Stage 2: polish the best point with a fast local optimizer
 (`local_optimizer`, e.g. `OptimPLEConfig(Fminbox(LBFGS()))` or `NLoptPLEConfig(:LN_BOBYQA)`).
 
-This is the recommended optimizer for the COVID-19 conditional PLE because the
-epidemiological loss is multimodal (global stage) but locally smooth enough for
-gradient/direct-search polishing.
+It suits losses that are multimodal (global stage) but locally smooth enough
+for gradient/direct-search polishing, as is common for ODE models.
 """
 struct HybridOptimizerConfig{G,L} <: AbstractPLEOptimizer
     global_optimizer::G
